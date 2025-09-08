@@ -84,7 +84,7 @@ Please refer to the following sections for additional details on our training an
 
 ### Clone this repository.
 ```bash
-git clone https://github.com/Anttwo/MILo_private.git --recursive
+git clone https://github.com/Anttwo/MILo.git --recursive
 ```
 
 ### Install dependencies.
