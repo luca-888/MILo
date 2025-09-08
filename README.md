@@ -27,7 +27,7 @@ SIGGRAPH Asia 2025 - Journal Track (TOG)<br>
 *Both authors contributed equally to the paper.
 </font>
 
-| <a href="https://anttwo.github.io/milo">Webpage</a> | <a href="https://arxiv.org/abs/2506.24096">arXiv</a> | <a href="https://www.youtube.com/watch?v=_SGNhhNz0fE">Presentation video</a> | <a href="https://drive.google.com/drive/folders/1Bf7DM2DFtQe4J63bEFLceEycNf4qTcqm?usp=sharing">Data</a> |
+| <a href="https://anttwo.github.io/milo">Webpage</a> | <a href="https://arxiv.org/abs/2506.24096">arXiv</a> | <a href="https://www.youtube.com/watch?v=rOBs2yyYaJM">Presentation video</a> | <a href="https://drive.google.com/drive/folders/1Bf7DM2DFtQe4J63bEFLceEycNf4qTcqm?usp=sharing">Data</a> |
 
 ![Teaser image](assets/teaser.png)
 </div>
