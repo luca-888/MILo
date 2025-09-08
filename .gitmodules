@@ -1,0 +1,6 @@
+[submodule "submodules/Depth-Anything-V2"]
+	path = submodules/Depth-Anything-V2
+	url = https://github.com/DepthAnything/Depth-Anything-V2
+[submodule "submodules/nvdiffrast"]
+	path = submodules/nvdiffrast
+	url = https://github.com/NVlabs/nvdiffrast
