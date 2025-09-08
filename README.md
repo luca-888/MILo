@@ -4,6 +4,10 @@
 MILo: Mesh-In-the-Loop Gaussian Splatting for Detailed and Efficient Surface Reconstruction
 </h1>
 
+<font size="5">
+SIGGRAPH Asia 2025 - Journal Track (TOG)<br>
+</font>
+
 <font size="4">
 <a href="https://anttwo.github.io/" style="font-size:100%;">Antoine Guédon*<sup>1</sup></a>&emsp;
 <a href="https://www.lix.polytechnique.fr/Labo/Diego.GOMEZ/" style="font-size:100%;">Diego Gomez*<sup>1</sup></a>&emsp;
