@@ -45,6 +45,18 @@ _Our method introduces a novel differentiable mesh extraction framework that ope
 - ✅ Clean code.
 - ✅ Basic refacto.
 
+## License
+
+<details>
+<summary>Click here to see content.</summary>
+
+<br>This project builds on existing open-source implementations of various projects cited in the __Acknowledgements__ section.
+
+Specifically, it builds on the original implementation of [3D Gaussian Splatting](https://github.com/graphdeco-inria/gaussian-splatting); As a result, parts of this code are licensed under the Gaussian-Splatting License (see `./LICENSE.md`). 
+
+This codebase also builds on various other repositories such as [Nvdiffrast](https://github.com/NVlabs/nvdiffrast); Please refer to the license files of the submodules for more details.
+</details>
+
 ## 0. Quickstart
 
 <details>
@@ -620,6 +632,8 @@ We build this project based on [Gaussian Splatting](https://github.com/graphdeco
 We propose to use rasterization techniques from [RaDe-GS](https://baowenz.github.io/radegs/) and [GOF](https://github.com/autonomousvision/gaussian-opacity-fields/tree/main).
 
 The latter incorporate the filters proposed in [Mip-Splatting](https://github.com/autonomousvision/mip-splatting), the loss functions of [2D GS](https://github.com/hbb1/2d-gaussian-splatting) and its preprocessed DTU dataset.
+
+We use [Nvdiffrast](https://github.com/NVlabs/nvdiffrast) for differentiable triangle rasterization, and [DepthAnythingV2](https://github.com/DepthAnything/Depth-Anything-V2) for computing our optional depth-order regularization loss relying on monocular depth estimation.
 
 The evaluation scripts for the Tanks and Temples dataset are sourced from [TanksAndTemples](https://github.com/isl-org/TanksAndTemples/tree/master/python_toolbox/evaluation).
 
