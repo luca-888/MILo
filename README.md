@@ -132,10 +132,10 @@ If you encounter problems or if the installation script does not work, please fo
 
 ```bash
 # For CUDA 11.8
-conda install pytorch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1 pytorch-cuda=11.8 -c pytorch -c nvidia
+conda install pytorch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1 pytorch-cuda=11.8 mkl=2023.1.0 -c pytorch -c nvidia
 
 # For CUDA 12.1 (The code has only been tested on CUDA 11.8)
-conda install pytorch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1 pytorch-cuda=12.1 -c pytorch -c nvidia
+conda install pytorch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1 pytorch-cuda=12.1 mkl=2023.1.0 -c pytorch -c nvidia
 
 pip install -r requirements.txt
 
