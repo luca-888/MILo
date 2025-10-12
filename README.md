@@ -40,6 +40,7 @@ _Our method introduces a novel differentiable mesh extraction framework that ope
 
 - ⬛ Implement a simple training viewer using the <a href="https://github.com/graphdeco-inria/graphdecoviewer">GraphDeco viewer</a>.
 - ⬛ Add the mesh-based rendering evaluation scripts in `./milo/eval/mesh_nvs`.
+- ✅ Add low-res and very-low-res training for light output meshes (under 50MB and under 20MB).
 - ✅ Add T&T evaluation scripts in `./milo/eval/tnt/`.
 - ✅ Add Blender add-on (for mesh-based editing and animation) to the repo.
 - ✅ Clean code.
@@ -213,7 +214,7 @@ The list of optional arguments is provided below:
 |----------|----------|---------|---------|-------------|
 | **Performance & Logging** | `--data_device` | `"cpu"` or `"cuda"` | `"cuda"` | Forces data to be loaded on CPU (less GPU memory usage, slightly slower training) |
 | | `--log_interval` | integer | - | Log images every N training iterations (e.g., `200`) |
-| **Mesh Configuration** | `--mesh_config` | `"default"`, `"highres"`, `"veryhighres"` | `"default"` | Config file for mesh resolution and quality |
+| **Mesh Configuration** | `--mesh_config` | `"default"`, `"highres"`, `"veryhighres"`, `"lowres"`, `"verylowres"` | `"default"` | Config file for mesh resolution and quality |
 | **Evaluation & Appearance** | `--eval` | flag | disabled | Performs the usual train/test split for evaluation |
 | | `--decoupled_appearance` | flag | disabled | Better handling of exposure variations |
 | **Depth-Order Regularization** | `--depth_order` | flag | disabled | Enable depth-order regularization with DepthAnythingV2 |
@@ -229,9 +230,17 @@ for the base setting and 5M Delaunay vertices for the `--dense_gaussians` settin
 resolution meshes. We recommend using this config with `--dense_gaussians`. This config 
 results in higher resolution representations, containing up to 9M Delaunay vertices.
 - **Very High Res config**: You can use `--mesh_config veryhighres --dense_gaussians` for 
-even higher resolution meshes. We recommend using this config with `--dense_gaussians`. This 
-config results in even higher resolution representations, containing up to 14M Delaunay 
+even higher resolution meshes. We recommend using this config with `--dense_gaussians`. 
+This config results in even higher resolution representations, containing up to 14M Delaunay 
 vertices. This configuration requires more memory for training.
+- **Low Res config**: You can use `--mesh_config lowres` for lower resolution meshes (less than 50MB). 
+This config results in lower resolution representations, containing up to 500k Delaunay vertices.
+You can adjust the number of Gaussians used during training accordingly by decreasing the sampling factor
+with `--sampling_factor 0.3`, for instance.
+- **Very Low Res config**: You can use `--mesh_config verylowres` for even lower resolution meshes (less than 20MB). 
+This config results in even lower resolution representations, containing up to 250k Delaunay vertices.
+You can adjust the number of Gaussians used during training accordingly by decreasing the sampling factor
+with `--sampling_factor 0.1`, for instance.
 
 Please refer to the <a href="https://depth-anything-v2.github.io/">DepthAnythingV2</a> repo to download the `vitl` checkpoint required for Depth-Order regularization. Then, move the checkpoint file to `./submodules/Depth-Anything-V2/checkpoints/`.
 
@@ -250,6 +259,11 @@ python train.py -s <PATH TO COLMAP DATASET> -m <OUTPUT_DIR> --imp_metric outdoor
 Full featured training with very high resolution:
 ```bash
 python train.py -s <PATH TO COLMAP DATASET> -m <OUTPUT_DIR> --imp_metric indoor --rasterizer radegs --dense_gaussians --mesh_config veryhighres --decoupled_appearance --log_interval 200 --data_device cpu
+```
+
+Very low resolution training in indoor scenes for very light meshes (less than 20MB):
+```bash
+python train.py -s <PATH TO COLMAP DATASET> -m <OUTPUT_DIR> --imp_metric indoor --rasterizer radegs --sampling_factor 0.1 --mesh_config verylowres
 ```
 
 Training with depth-order regularization:
@@ -277,7 +291,7 @@ python mesh_extract_sdf.py \
 ```
 This script will further refine the SDF values for a short period of time (1000 iterations by default) with frozen Gaussians, then save the mesh as a PLY file with vertex colors. The mesh will be located at `<MODEL_DIR>/mesh_learnable_sdf.ply`.
 
-**WARNING:** Make sure you use the same mesh config file as the one used during training. You can change the config file by specifying `--config <CONFIG_NAME>`. The default config file name is `default`, but you can switch to `highres` or `veryhighres`.
+**WARNING:** Make sure you use the same mesh config file as the one used during training. You can change the config file by specifying `--config <CONFIG_NAME>`. The default config file name is `default`, but you can switch to `highres`, `veryhighres`, `lowres` or `verylowres`.
 
 You can use the usual train/test split by adding the argument `--eval`. 
 
