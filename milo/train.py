@@ -45,6 +45,9 @@ from regularization.regularizer.mesh import (
     reset_mesh_state_at_next_iteration,
 )
 
+from regularization.bilateral_grid.lib_bilagrid import total_variation_loss
+from torchvision.utils import save_image
+
 def training(
     dataset, opt, pipe, 
     testing_iterations, saving_iterations, 
@@ -64,11 +67,18 @@ def training(
         use_mip_filter=use_mip_filter, 
         learn_occupancy=args.mesh_regularization,
         use_appearance_network=args.decoupled_appearance,
+        use_bilateral_grid=args.use_bilateral_grid
     )
     scene = Scene(dataset, gaussians, resolution_scales=[1,2])
+    # scene = Scene(dataset, gaussians, resolution_scales=[1])
+
+    if args.use_bilateral_grid:
+        gaussians.build_bilateral_grid(len(scene.train_cameras[1]), args.grid_shape)
+
     gaussians.training_setup(opt)
     print(f"[INFO] Using 3D Mip Filter: {gaussians.use_mip_filter}")
     print(f"[INFO] Using learnable SDF: {gaussians.learn_occupancy}")
+    print(f"[INFO] Using bilateral grid: {args.use_bilateral_grid}")
     if args.dense_gaussians:
         print("[INFO] Using dense Gaussians.")
     if checkpoint:
@@ -119,6 +129,7 @@ def training(
             device='cuda',
         )
     ema_depth_order_loss_for_log = 0.0
+    ema_tv_loss_for_log = 0.0
         
     # ---Log optimizable param groups---
     print(f"[INFO] Found {len(gaussians.optimizer.param_groups)} optimizable param groups:")
@@ -215,6 +226,19 @@ def training(
         )
         gt_image = viewpoint_cam.original_image.cuda()
 
+
+        if gaussians.use_bilateral_grid:
+            if iteration % 500 == 0:
+                image_before = image.clone().detach()
+
+                save_image(image_before, f"img/render_before_bilateral_{viewpoint_idx}_{iteration}.png")
+            image = gaussians._apply_bilateral_grid(
+                image, viewpoint_idx, viewpoint_cam.image_height, viewpoint_cam.image_width
+            )
+            if iteration % 500 == 0:
+                image_after = image.clone().detach()
+
+                save_image(image_after, f"img/render_after_bilateral_{viewpoint_idx}_{iteration}.png")
         # Rendering loss
         if args.decoupled_appearance:
             Ll1 = L1_loss_appearance(image, gt_image, gaussians, viewpoint_cam.uid)
@@ -308,6 +332,10 @@ def training(
             
             loss = loss + mesh_loss
         
+        if gaussians.use_bilateral_grid:
+            tv_loss = 10 * total_variation_loss(gaussians.bil_grids.grids)
+            loss = loss + tv_loss
+
         # ---Backward pass---
         loss.backward()
 
@@ -333,10 +361,11 @@ def training(
                 mesh_depth_loss if mesh_kick_on else None, mesh_normal_loss if mesh_kick_on else None, 
                 occupied_centers_loss if mesh_kick_on else None, occupancy_labels_loss if mesh_kick_on else None, 
                 depth_prior_loss if depth_order_kick_on else None,
+                tv_loss if gaussians.use_bilateral_grid else None,
                 mesh_config if mesh_kick_on else None, 
                 postfix_dict, ema_loss_for_log, ema_depth_normal_loss_for_log, ema_mesh_depth_loss_for_log, 
                 ema_mesh_normal_loss_for_log, ema_occupied_centers_loss_for_log, ema_occupancy_labels_loss_for_log,
-                ema_depth_order_loss_for_log, testing_iterations, saving_iterations, render_imp,
+                ema_depth_order_loss_for_log, ema_tv_loss_for_log, testing_iterations, saving_iterations, render_imp,
             )
 
             # ---Densification---
@@ -458,7 +487,7 @@ def training(
 
             # ---Optimizer step---
             if iteration < opt.iterations:
-                if gaussians.use_appearance_network:
+                if gaussians.use_appearance_network or gaussians.use_bilateral_grid:
                     gaussians.optimizer.step()
                 else:
                     visible = radii>0
@@ -552,7 +581,7 @@ if __name__ == "__main__":
     parser.add_argument("--aggressive_clone_from_iter", type=int, default = 500)
     parser.add_argument("--aggressive_clone_interval", type=int, default = 250)
     # Depth Reinitialization
-    parser.add_argument("--warn_until_iter", type=int, default = 3_000)
+    parser.add_argument("--warn_until_iter", type=int, default = 3000)
     parser.add_argument("--depth_reinit_iter", type=int, default=2_000)
     parser.add_argument("--num_depth_factor", type=float, default=1)
     # Simplification
@@ -580,6 +609,8 @@ if __name__ == "__main__":
     # > Inspired by GOF.
     parser.add_argument("--decoupled_appearance", action="store_true")
 
+    # ---- bilateral_grid
+    parser.add_argument("--use_bilateral_grid", action="store_true")
     # ----- Logging -----
     parser.add_argument("--log_interval", type=int, default=None)
     parser.add_argument("--wandb_project", type=str, default=None)

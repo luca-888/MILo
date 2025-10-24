@@ -24,6 +24,7 @@ from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scene.appearance_network import AppearanceNetwork
 from utils.sh_utils import SH2RGB
 import trimesh
+from regularization.bilateral_grid.lib_bilagrid import BilateralGrid, slice, total_variation_loss
 
 try:
     from diff_gaussian_rasterization_ms import SparseGaussianAdam
@@ -73,6 +74,7 @@ class GaussianModel:
         learn_occupancy : bool = False,
         use_radegs_densification : bool = False,
         use_appearance_network : bool = False,
+        use_bilateral_grid: bool = False
     ):
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree  
@@ -114,6 +116,19 @@ class GaussianModel:
             self.xyz_gradient_accum_abs = torch.empty(0)
             self.xyz_gradient_accum_abs_max = torch.empty(0)
 
+        self.use_bilateral_grid = use_bilateral_grid
+
+    def build_bilateral_grid(self, num_train_data, grid_shape):
+        self.bil_grids = BilateralGrid(
+            num=num_train_data,
+            grid_X=grid_shape[0],
+            grid_Y=grid_shape[1],
+            grid_W=grid_shape[2],
+        )
+        self.bil_grids = self.bil_grids.cuda() 
+        for param in self.bil_grids.parameters():
+            param.requires_grad = True
+
     def capture(self):
         to_return = (
             self.active_sh_degree,
@@ -133,6 +148,8 @@ class GaussianModel:
             to_return += (self._base_occupancy, self._occupancy_shift)
         if self.use_appearance_network:
             to_return += (self.appearance_network.state_dict(), self._appearance_embeddings,)
+        if self.use_bilateral_grid:
+            to_return += (self.bil_grids.state_dict(),)
         return to_return
     
     def restore(self, model_args, training_args):
@@ -157,6 +174,10 @@ class GaussianModel:
             app_dict = model_args[start_idx]
             self._appearance_embeddings = model_args[start_idx + 1]
             start_idx = start_idx + 2
+        if self.use_bilateral_grid:
+            bi_dict = model_args[start_idx]
+            start_idx = start_idx + 1
+
         if start_idx != len(model_args):
             print(f"[ WARNING ] Restoring model with extra arguments: Only {start_idx} arguments expected, but {len(model_args)} provided.")
         
@@ -166,6 +187,8 @@ class GaussianModel:
         self.optimizer.load_state_dict(opt_dict)
         if self.use_appearance_network:
             self.appearance_network.load_state_dict(app_dict)
+        if self.use_bilateral_grid:
+            self.bil_grids.load_state_dict(bi_dict)
 
     @property
     def get_scaling(self):
@@ -536,6 +559,52 @@ class GaussianModel:
             with torch.no_grad():
                 return self._get_tetra_points(**kwargs)
 
+    def _apply_bilateral_grid(self, rgb: torch.Tensor, cam_idx: int, H: int, W: int) -> torch.Tensor:
+        # make xy grid
+        grid_y, grid_x = torch.meshgrid(
+            torch.linspace(0, 1.0, H, device="cuda"),
+            torch.linspace(0, 1.0, W, device="cuda"),
+            indexing="ij",
+        )
+        grid_xy = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
+        orig_shape = rgb.shape
+
+        if rgb.dim() == 3 and rgb.shape[0] == 3:
+            # (3, H, W) -> (1, H, W, 3)
+            rgb_proc = rgb.permute(1, 2, 0).unsqueeze(0).contiguous()
+        elif rgb.dim() == 4 and rgb.shape[1] == 3:
+            # (B, 3, H, W) -> (B, H, W, 3)
+            rgb_proc = rgb.permute(0, 2, 3, 1).contiguous()
+        elif rgb.dim() >= 3 and rgb.shape[-1] == 3:
+            # already (..., 3) → ensure batch dim
+            if rgb.dim() == 3:  # (H, W, 3) -> (1, H, W, 3)
+                rgb_proc = rgb.unsqueeze(0).contiguous()
+            else:  # e.g. (B, H, W, 3)
+                rgb_proc = rgb
+        else:
+            raise ValueError(
+        f"Unexpected rgb shape: {rgb.shape}. " "Expected [3,H,W], [B,3,H,W], [H,W,3], or [B,H,W,3].")
+
+
+        out = slice(
+            bil_grids=self.bil_grids,
+            rgb=rgb_proc,
+            xy=grid_xy,
+            grid_idx=torch.tensor(cam_idx, device="cuda", dtype=torch.long),
+        )
+        rgb_out = out["rgb"]
+                # convert back to original layout
+        if len(orig_shape) == 3 and orig_shape[0] == 3:
+            # (1, H, W, 3) -> (H, W, 3) -> (3, H, W)
+            rgb_out = rgb_out.squeeze(0).permute(2, 0, 1).contiguous()
+        elif len(orig_shape) == 3 and orig_shape[-1] == 3:
+            # (1, H, W, 3) -> (H, W, 3)
+            rgb_out = rgb_out.squeeze(0).contiguous()
+        else:
+            raise ValueError(f"Unexpected orig shape: {orig_shape}. ""Expected [3,H,W] or [H,W,3]." )
+
+        return rgb_out
+
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -563,10 +632,17 @@ class GaussianModel:
                 {'params': self.appearance_network.parameters(), 'lr': training_args.appearance_network_lr, "name": "appearance_network"}
             ]
 
-        if self.use_appearance_network:
+        if self.use_bilateral_grid:
+            l = l + [
+                {'params': self.bil_grids.parameters(), 'lr': training_args.bilateral_grid_lr, "name": "bilateral_grid"}
+            ]
+
+        if self.use_appearance_network or self.use_bilateral_grid:
             self.optimizer = Adam(l, lr=0.0, eps=1e-15)
         else:
             self.optimizer = SparseGaussianAdam(l, lr=0.0, eps=1e-15)
+
+
 
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
@@ -760,7 +836,7 @@ class GaussianModel:
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-            if group["name"] in ["appearance_embeddings", "appearance_network"]:
+            if group["name"] in ["appearance_embeddings", "appearance_network", "bilateral_grid"]:
                 continue
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
@@ -807,7 +883,7 @@ class GaussianModel:
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-            if group["name"] in ["appearance_embeddings", "appearance_network"]:
+            if group["name"] in ["appearance_embeddings", "appearance_network", "bilateral_grid"]:
                 continue
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]

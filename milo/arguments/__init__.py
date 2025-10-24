@@ -12,7 +12,7 @@
 from argparse import ArgumentParser, Namespace
 import sys
 import os
-
+from typing import Tuple
 class GroupParams:
     pass
 
@@ -57,6 +57,11 @@ class ModelParams(ParamGroup):
         # self.use_decoupled_appearance = False
         self.llff = 8
         self.kernel_size = 0.0  # Added
+
+        # bilateral_grid
+        # self.use_bilateral_grid = False
+        self.grid_shape: Tuple[int, int, int] = (16, 16, 8)
+
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -93,6 +98,7 @@ class OptimizationParams(ParamGroup):
         self.random_background = False
         self.appearance_embeddings_lr = 0.001
         self.appearance_network_lr = 0.001
+        self.bilateral_grid_lr = 0.002
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

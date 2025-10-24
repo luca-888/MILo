@@ -170,6 +170,7 @@ def log_training_progress(
     loss:torch.Tensor, depth_normal_loss:torch.Tensor, mesh_depth_loss:torch.Tensor,
     mesh_normal_loss:torch.Tensor, occupied_centers_loss:torch.Tensor, occupancy_labels_loss:torch.Tensor,
     depth_prior_loss:torch.Tensor,
+    tv_loss:torch.Tensor,
     # Configs
     mesh_config:Dict[str, Any],
     # EMA losses for logging
@@ -177,6 +178,7 @@ def log_training_progress(
     ema_mesh_depth_loss_for_log:float, ema_mesh_normal_loss_for_log:float,
     ema_occupied_centers_loss_for_log:float, ema_occupancy_labels_loss_for_log:float,
     ema_depth_order_loss_for_log:float,
+    ema_tv_loss_for_log:float,
     # Additional arguments
     testing_iterations:List[int], saving_iterations:List[int], render_imp,
 ):
@@ -196,8 +198,13 @@ def log_training_progress(
     if depth_order_kick_on:
         ema_depth_order_loss_for_log = 0.4 * depth_prior_loss.item() + 0.6 * ema_depth_order_loss_for_log
     
+    if tv_loss:
+        ema_tv_loss_for_log = 0.4 * tv_loss.item() + 0.6 * ema_tv_loss_for_log
+
     if iteration % 10 == 0:
         postfix_dict = {"Loss": f"{ema_loss_for_log:.{7}f}"}
+        if tv_loss:
+            postfix_dict['TVLoss'] = f"{ema_tv_loss_for_log:.{7}f}"
         if reg_kick_on:
             postfix_dict["DNLoss"] = f"{ema_depth_normal_loss_for_log:.{7}f}"
         if depth_order_kick_on:
