@@ -181,6 +181,15 @@ def log_training_progress(
     ema_tv_loss_for_log:float,
     # Additional arguments
     testing_iterations:List[int], saving_iterations:List[int], render_imp,
+    # MoGe supervision
+    moge_kick_on:bool,
+    moge_depth_loss:torch.Tensor,
+    moge_normal_loss:torch.Tensor,
+    ema_moge_depth_loss_for_log:float,
+    ema_moge_normal_loss_for_log:float,
+    moge_supervision_depth:torch.Tensor,
+    moge_supervision_normal:torch.Tensor,
+    moge_supervision_mask:torch.Tensor,
 ):
     WANDB_FOUND = run is not None
     
@@ -197,6 +206,11 @@ def log_training_progress(
             ema_occupancy_labels_loss_for_log = 0.4 * occupancy_labels_loss.item() + 0.6 * ema_occupancy_labels_loss_for_log
     if depth_order_kick_on:
         ema_depth_order_loss_for_log = 0.4 * depth_prior_loss.item() + 0.6 * ema_depth_order_loss_for_log
+    if moge_kick_on:
+        if moge_depth_loss is not None:
+            ema_moge_depth_loss_for_log = 0.4 * moge_depth_loss.item() + 0.6 * ema_moge_depth_loss_for_log
+        if moge_normal_loss is not None:
+            ema_moge_normal_loss_for_log = 0.4 * moge_normal_loss.item() + 0.6 * ema_moge_normal_loss_for_log
     
     if tv_loss:
         ema_tv_loss_for_log = 0.4 * tv_loss.item() + 0.6 * ema_tv_loss_for_log
@@ -209,6 +223,11 @@ def log_training_progress(
             postfix_dict["DNLoss"] = f"{ema_depth_normal_loss_for_log:.{7}f}"
         if depth_order_kick_on:
             postfix_dict["DOLoss"] = f"{ema_depth_order_loss_for_log:.{7}f}"
+        if moge_kick_on:
+            if moge_depth_loss is not None:
+                postfix_dict["MoDepthLoss"] = f"{ema_moge_depth_loss_for_log:.{7}f}"
+            if moge_normal_loss is not None:
+                postfix_dict["MoNormLoss"] = f"{ema_moge_normal_loss_for_log:.{7}f}"
         if mesh_kick_on:
             postfix_dict["MDLoss"] = f"{ema_mesh_depth_loss_for_log:.{7}f}"
             postfix_dict["MNLoss"] = f"{ema_mesh_normal_loss_for_log:.{7}f}"
@@ -239,6 +258,20 @@ def log_training_progress(
             images_to_log.append((1. - depth_to_normal(viewpoint_cam, do_supervision_depth)) / 2.)
             titles_to_log.append(f"Supervision Depth to Normal {viewpoint_idx}")
         
+        if moge_kick_on and moge_supervision_depth is not None:
+            if moge_supervision_mask is not None:
+                images_to_log.append(moge_supervision_depth * moge_supervision_mask)
+            else:
+                images_to_log.append(moge_supervision_depth)
+            titles_to_log.append(f"MoGe Depth {viewpoint_idx}")
+        if moge_kick_on and moge_supervision_normal is not None:
+            if moge_supervision_mask is not None:
+                normal_to_log = moge_supervision_normal * moge_supervision_mask
+            else:
+                normal_to_log = moge_supervision_normal
+            images_to_log.append((1. - normal_to_log) / 2.)
+            titles_to_log.append(f"MoGe Normal {viewpoint_idx}")
+    
         images_to_log.append(render_pkg["render"])
         titles_to_log.append(f"Rendered RGB {viewpoint_idx}")
         
@@ -325,5 +358,5 @@ def log_training_progress(
         ema_depth_normal_loss_for_log, 
         ema_mesh_depth_loss_for_log, ema_mesh_normal_loss_for_log, 
         ema_occupied_centers_loss_for_log, ema_occupancy_labels_loss_for_log, 
-        ema_depth_order_loss_for_log
+        ema_depth_order_loss_for_log, ema_moge_depth_loss_for_log, ema_moge_normal_loss_for_log
     )

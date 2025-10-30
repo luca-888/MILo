@@ -32,6 +32,7 @@ except ImportError:
 
 import numpy as np
 import time
+import torch.nn.functional as F
 
 from utils.geometry_utils import depth_to_normal
 from utils.log_utils import log_training_progress
@@ -44,6 +45,10 @@ from regularization.regularizer.mesh import (
     compute_mesh_regularization,
     reset_mesh_state_at_next_iteration,
 )
+from regularization.regularizer.moge import (
+    initialize_moge_supervision,
+    compute_moge_regularization,
+)
 
 from regularization.bilateral_grid.lib_bilagrid import total_variation_loss
 from torchvision.utils import save_image
@@ -53,7 +58,7 @@ def training(
     testing_iterations, saving_iterations, 
     checkpoint_iterations, checkpoint, 
     debug_from, args, 
-    depth_order_config, mesh_config,
+    depth_order_config, moge_config, mesh_config,
     log_interval,
 ):
     # ---Prepare logger--- 
@@ -129,6 +134,21 @@ def training(
             device='cuda',
         )
     ema_depth_order_loss_for_log = 0.0
+    moge_supervision = None
+    if args.moge or args.moge_mask_training:
+        print("[INFO] Initializing MoGe inference.")
+        if args.moge and moge_config:
+            print(f"        > Depth mode: {moge_config.get('depth', 'none')}")
+            print(f"        > Normal supervision: {moge_config.get('normal', moge_config.get('noraml', False))}")
+        moge_supervision = initialize_moge_supervision(
+            scene=scene,
+            config=moge_config,
+            device="cuda",
+        )
+    if args.moge_mask_training:
+        print("[INFO] Applying MoGe mask to photometric losses.")
+    ema_moge_depth_loss_for_log = 0.0
+    ema_moge_normal_loss_for_log = 0.0
     ema_tv_loss_for_log = 0.0
         
     # ---Log optimizable param groups---
@@ -192,6 +212,16 @@ def training(
         reg_kick_on = iteration >= args.regularization_from_iter
         mesh_kick_on = args.mesh_regularization and (iteration >= mesh_config["start_iter"])
         depth_order_kick_on = args.depth_order
+        moge_enabled = args.moge
+        moge_depth_mode = (
+            moge_config.get("depth", "none").lower() if (moge_enabled and moge_config) else "none"
+        )
+        moge_requires_expected_depth = (
+            moge_enabled
+            and moge_config
+            and moge_depth_mode != "none"
+            and moge_config.get("depth_ratio", 1.0) < 1.0
+        )
         
         # If depth-normal regularization or mesh-in-the-loop regularization are active,
         # we use the rasterizer compatible with depth and normal rendering.
@@ -201,15 +231,19 @@ def training(
                 require_coord=False, require_depth=True,
             )
             
-        # Else, if depth-order regularization is active, we use Mini-Splatting2 rasterizer 
+        # Else, if depth-order or MoGe supervision is active, we use Mini-Splatting2 rasterizer 
         # but we render depth maps. This rasterizer is necessary for densification and simplification.
-        elif depth_order_kick_on:
+        elif depth_order_kick_on or moge_enabled:
             render_pkg = render_full(
                 viewpoint_cam, gaussians, pipe, background, 
                 culling=gaussians._culling[:,viewpoint_cam.uid],
                 compute_expected_normals=False,
-                compute_expected_depth=True,
-                compute_accurate_median_depth_gradient=True,
+                compute_expected_depth=(
+                    depth_order_kick_on or moge_requires_expected_depth
+                ),
+                compute_accurate_median_depth_gradient=(
+                    depth_order_kick_on or (moge_enabled and moge_depth_mode != "none")
+                ),
             )
             
         # If no regularization is active, we just use the default Mini-Splatting2 rasterizer.
@@ -226,6 +260,29 @@ def training(
         )
         gt_image = viewpoint_cam.original_image.cuda()
 
+        moge_training_mask = None
+        if (
+            args.moge
+            and args.moge_mask_training
+            and moge_supervision is not None
+        ):
+            mask_tensor = moge_supervision["depth_mask"][viewpoint_idx].to(image.device)
+            if mask_tensor.dim() == 2:
+                mask_tensor = mask_tensor.unsqueeze(0)
+            if mask_tensor.shape[-2:] != image.shape[-2:]:
+                mask_tensor = F.interpolate(
+                    mask_tensor.unsqueeze(0), size=image.shape[-2:], mode="nearest"
+                ).squeeze(0)
+            mask_tensor = (mask_tensor > 0.5).to(image.dtype)
+            if mask_tensor.sum() > 0:
+                moge_training_mask = mask_tensor
+            else:
+                moge_training_mask = None
+        
+        if moge_training_mask is not None:
+            mask_rgb = moge_training_mask.expand_as(image)
+        else:
+            mask_rgb = None
 
         if gaussians.use_bilateral_grid:
             if iteration % 500 == 0:
@@ -241,10 +298,30 @@ def training(
                 save_image(image_after, f"img/render_after_bilateral_{viewpoint_idx}_{iteration}.png")
         # Rendering loss
         if args.decoupled_appearance:
-            Ll1 = L1_loss_appearance(image, gt_image, gaussians, viewpoint_cam.uid)
+            if mask_rgb is not None:
+                transformed_image = L1_loss_appearance(
+                    image, gt_image, gaussians, viewpoint_cam.uid, return_transformed_image=True
+                )
+                diff = torch.abs(transformed_image - gt_image) * mask_rgb
+                Ll1 = diff.sum() / mask_rgb.sum().clamp_min(1e-6)
+                image_for_ssim = image * mask_rgb
+                gt_for_ssim = gt_image * mask_rgb
+            else:
+                Ll1 = L1_loss_appearance(image, gt_image, gaussians, viewpoint_cam.uid)
+                image_for_ssim = image
+                gt_for_ssim = gt_image
         else:
-            Ll1 = l1_loss(image, gt_image)
-        ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+            if mask_rgb is not None:
+                diff = torch.abs(image - gt_image) * mask_rgb
+                Ll1 = diff.sum() / mask_rgb.sum().clamp_min(1e-6)
+                image_for_ssim = image * mask_rgb
+                gt_for_ssim = gt_image * mask_rgb
+            else:
+                Ll1 = l1_loss(image, gt_image)
+                image_for_ssim = image
+                gt_for_ssim = gt_image
+
+        ssim_value = fused_ssim(image_for_ssim.unsqueeze(0), gt_for_ssim.unsqueeze(0))
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
         
         # Depth-Normal Consistency Regularization
@@ -294,6 +371,39 @@ def training(
             loss = loss + depth_prior_loss
             depth_order_kick_on = lambda_depth_order > 0
         
+        moge_depth_loss = None
+        moge_normal_loss = None
+        moge_supervision_depth = None
+        moge_supervision_normal = None
+        moge_lambda = 0.0
+        moge_supervision_mask = moge_training_mask
+        if moge_enabled and moge_supervision is not None:
+            moge_pkg = compute_moge_regularization(
+                iteration=iteration,
+                render_pkg=render_pkg,
+                viewpoint_idx=viewpoint_idx,
+                gaussians=gaussians,
+                config=moge_config,
+                moge_supervision=moge_supervision,
+            )
+            loss = loss + moge_pkg["total_loss"]
+            moge_depth_loss = moge_pkg["depth_loss"]
+            moge_normal_loss = moge_pkg["normal_loss"]
+            moge_supervision_depth = moge_pkg["supervision_depth"]
+            moge_supervision_normal = moge_pkg["supervision_normal"]
+            if moge_pkg["supervision_mask"] is not None:
+                moge_supervision_mask = moge_pkg["supervision_mask"]
+            moge_lambda = moge_pkg["lambda_value"]
+        moge_kick_on = (
+            moge_enabled
+            and (moge_lambda > 0)
+            and (
+                (moge_depth_loss is not None)
+                or (moge_normal_loss is not None)
+            )
+        )
+        moge_logging_active = moge_kick_on or (moge_training_mask is not None)
+
         # Mesh-In-the-Loop Regularization
         if mesh_kick_on:
             if args.detach_gaussian_rendering:
@@ -349,7 +459,7 @@ def training(
                 ema_depth_normal_loss_for_log, 
                 ema_mesh_depth_loss_for_log, ema_mesh_normal_loss_for_log, 
                 ema_occupied_centers_loss_for_log, ema_occupancy_labels_loss_for_log, 
-                ema_depth_order_loss_for_log
+                ema_depth_order_loss_for_log, ema_moge_depth_loss_for_log, ema_moge_normal_loss_for_log
             ) = log_training_progress(
                 args, iteration, log_interval, progress_bar, run,
                 scene, gaussians, pipe, opt, background,
@@ -366,6 +476,14 @@ def training(
                 postfix_dict, ema_loss_for_log, ema_depth_normal_loss_for_log, ema_mesh_depth_loss_for_log, 
                 ema_mesh_normal_loss_for_log, ema_occupied_centers_loss_for_log, ema_occupancy_labels_loss_for_log,
                 ema_depth_order_loss_for_log, ema_tv_loss_for_log, testing_iterations, saving_iterations, render_imp,
+                moge_logging_active,
+                moge_depth_loss if moge_kick_on else None,
+                moge_normal_loss if moge_kick_on else None,
+                ema_moge_depth_loss_for_log,
+                ema_moge_normal_loss_for_log,
+                moge_supervision_depth if moge_kick_on else None,
+                moge_supervision_normal if moge_kick_on else None,
+                moge_supervision_mask,
             )
 
             # ---Densification---
@@ -600,6 +718,11 @@ if __name__ == "__main__":
     parser.add_argument("--depth_order", action="store_true")
     parser.add_argument("--depth_order_config", type=str, default="default")
 
+    parser.add_argument("--moge", action="store_true")
+    parser.add_argument("--moge_config", type=str, default="default")
+    parser.add_argument("--moge_mask_training", action="store_true",
+                        help="Apply MoGe mask to primary photometric losses.")
+
     # ----- 3D Mip Filter -----
     # > Inspired by Mip-Splatting.
     parser.add_argument("--disable_mip_filter", action="store_true", default=False)
@@ -639,6 +762,15 @@ if __name__ == "__main__":
     else:
         depth_order_config = None
         
+    if args.moge or args.moge_mask_training:
+        moge_config_file = os.path.join(BASE_DIR, "configs", "moge_supervise", f"{args.moge_config}.yaml")
+        with open(moge_config_file, "r") as f:
+            moge_config = yaml.safe_load(f)
+        if "normal" not in moge_config and "noraml" in moge_config:
+            moge_config["normal"] = moge_config["noraml"]
+    else:
+        moge_config = None
+
     # Load mesh-in-the-loop regularization config
     if args.mesh_regularization:
         # Get mesh regularization config file
@@ -679,6 +811,7 @@ if __name__ == "__main__":
         lp.extract(args), op.extract(args), pp.extract(args), 
         args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args,
         depth_order_config,
+        moge_config,
         mesh_config,
         args.log_interval,
     )
