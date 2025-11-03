@@ -171,6 +171,7 @@ def log_training_progress(
     mesh_normal_loss:torch.Tensor, occupied_centers_loss:torch.Tensor, occupancy_labels_loss:torch.Tensor,
     depth_prior_loss:torch.Tensor,
     tv_loss:torch.Tensor,
+    scale_loss:torch.Tensor,
     # Configs
     mesh_config:Dict[str, Any],
     # EMA losses for logging
@@ -178,6 +179,7 @@ def log_training_progress(
     ema_mesh_depth_loss_for_log:float, ema_mesh_normal_loss_for_log:float,
     ema_occupied_centers_loss_for_log:float, ema_occupancy_labels_loss_for_log:float,
     ema_depth_order_loss_for_log:float,
+    ema_scale_loss_for_log:float,
     ema_tv_loss_for_log:float,
     # Additional arguments
     testing_iterations:List[int], saving_iterations:List[int], render_imp,
@@ -206,6 +208,8 @@ def log_training_progress(
             ema_occupancy_labels_loss_for_log = 0.4 * occupancy_labels_loss.item() + 0.6 * ema_occupancy_labels_loss_for_log
     if depth_order_kick_on:
         ema_depth_order_loss_for_log = 0.4 * depth_prior_loss.item() + 0.6 * ema_depth_order_loss_for_log
+    if scale_loss is not None:
+        ema_scale_loss_for_log = 0.4 * scale_loss.item() + 0.6 * ema_scale_loss_for_log
     if moge_kick_on:
         if moge_depth_loss is not None:
             ema_moge_depth_loss_for_log = 0.4 * moge_depth_loss.item() + 0.6 * ema_moge_depth_loss_for_log
@@ -223,6 +227,8 @@ def log_training_progress(
             postfix_dict["DNLoss"] = f"{ema_depth_normal_loss_for_log:.{7}f}"
         if depth_order_kick_on:
             postfix_dict["DOLoss"] = f"{ema_depth_order_loss_for_log:.{7}f}"
+        if scale_loss is not None:
+            postfix_dict["ScaleLoss"] = f"{ema_scale_loss_for_log:.{7}f}"
         if moge_kick_on:
             if moge_depth_loss is not None:
                 postfix_dict["MoDepthLoss"] = f"{ema_moge_depth_loss_for_log:.{7}f}"
@@ -326,25 +332,26 @@ def log_training_progress(
                     wandb_log_dict[key] = value
             run.log(wandb_log_dict, step=iteration)
             
+            if iteration % 1000 == 0:
             # Log images
-            wandb_log_images_dict = {}
-            for log_img_name, log_img in log_images_dict.items():
-                wandb_img_to_log = log_img.clone().detach().squeeze()
-                # If grayscale, scale to 0-1 and apply colormap
-                if wandb_img_to_log.ndim < 3:
-                    wandb_img_to_log = (wandb_img_to_log - wandb_img_to_log.min()) / (wandb_img_to_log.max() - wandb_img_to_log.min())
-                    cmap = plt.get_cmap('Spectral')
-                    wandb_img_to_log = cmap(wandb_img_to_log)[..., :3]
-                    wandb_img_to_log = torch.from_numpy(wandb_img_to_log).to(torch.float32)
-                # If float, scale to 0-255
-                if wandb_img_to_log.dtype == torch.float32:
-                    wandb_img_to_log = (wandb_img_to_log.clamp(0., 1.) * 255).to(torch.uint8)
-                # Convert to wandb image
-                wandb_img_to_log = wandb_img_to_log.cpu().numpy()
-                wandb_log_images_dict[log_img_name.replace(str(viewpoint_idx), "")] = wandb.Image(
-                    wandb_img_to_log, caption=log_img_name
-                )
-            run.log(wandb_log_images_dict, step=iteration)
+                wandb_log_images_dict = {}
+                for log_img_name, log_img in log_images_dict.items():
+                    wandb_img_to_log = log_img.clone().detach().squeeze()
+                    # If grayscale, scale to 0-1 and apply colormap
+                    if wandb_img_to_log.ndim < 3:
+                        wandb_img_to_log = (wandb_img_to_log - wandb_img_to_log.min()) / (wandb_img_to_log.max() - wandb_img_to_log.min())
+                        cmap = plt.get_cmap('Spectral')
+                        wandb_img_to_log = cmap(wandb_img_to_log)[..., :3]
+                        wandb_img_to_log = torch.from_numpy(wandb_img_to_log).to(torch.float32)
+                    # If float, scale to 0-255
+                    if wandb_img_to_log.dtype == torch.float32:
+                        wandb_img_to_log = (wandb_img_to_log.clamp(0., 1.) * 255).to(torch.uint8)
+                    # Convert to wandb image
+                    wandb_img_to_log = wandb_img_to_log.cpu().numpy()
+                    wandb_log_images_dict[log_img_name.replace(str(viewpoint_idx), "")] = wandb.Image(
+                        wandb_img_to_log, caption=log_img_name
+                    )
+                run.log(wandb_log_images_dict, step=iteration)
 
     # ---Report---
     training_report(iteration, l1_loss, testing_iterations, scene, render_imp, (pipe, background))
@@ -358,5 +365,5 @@ def log_training_progress(
         ema_depth_normal_loss_for_log, 
         ema_mesh_depth_loss_for_log, ema_mesh_normal_loss_for_log, 
         ema_occupied_centers_loss_for_log, ema_occupancy_labels_loss_for_log, 
-        ema_depth_order_loss_for_log, ema_moge_depth_loss_for_log, ema_moge_normal_loss_for_log
+        ema_depth_order_loss_for_log, ema_scale_loss_for_log, ema_moge_depth_loss_for_log, ema_moge_normal_loss_for_log
     )

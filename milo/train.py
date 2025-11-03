@@ -33,6 +33,13 @@ except ImportError:
 import numpy as np
 import time
 import torch.nn.functional as F
+from contextlib import nullcontext
+from torch.profiler import (
+    profile as torch_profile,
+    schedule as profiler_schedule,
+    tensorboard_trace_handler,
+    ProfilerActivity,
+)
 
 from utils.geometry_utils import depth_to_normal
 from utils.log_utils import log_training_progress
@@ -150,7 +157,30 @@ def training(
     ema_moge_depth_loss_for_log = 0.0
     ema_moge_normal_loss_for_log = 0.0
     ema_tv_loss_for_log = 0.0
+    ema_scale_loss_for_log = 0.0
         
+    # ---Profiler setup---
+    if args.use_profiler:
+        profiler_output_dir = os.path.join(args.model_path, "profiler")
+        os.makedirs(profiler_output_dir, exist_ok=True)
+        profiler_activities = [ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            profiler_activities.append(ProfilerActivity.CUDA)
+        profiler_cm = torch_profile(
+            activities=profiler_activities,
+            schedule=profiler_schedule(wait=5, warmup=5, active=3, repeat=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                profiler_output_dir,  # 不要加子目录
+                worker_name="worker0"
+            ),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+)
+        print(f"[INFO] PyTorch profiler enabled. Traces stored in {profiler_output_dir}")
+    else:
+        profiler_cm = nullcontext()
+    
     # ---Log optimizable param groups---
     print(f"[INFO] Found {len(gaussians.optimizer.param_groups)} optimizable param groups:")
     n_total_params = 0
@@ -169,458 +199,471 @@ def training(
     print(f"\nTotal number of optimizable parameters: {n_total_params}\n")
     
     # ---Start optimization loop---    
-    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
-    first_iter += 1
+    with profiler_cm as profiler:
+        progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
+        first_iter += 1
 
-    for iteration in range(first_iter, opt.iterations + 1):   
+        for iteration in range(first_iter, opt.iterations + 1):   
 
-        if network_gui.conn == None:
-            network_gui.try_connect()
-        while network_gui.conn != None:
-            try:
-                net_image_bytes = None
-                custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
-                if custom_cam != None:
-                    net_image = render_imp(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
-                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
-                network_gui.send(net_image_bytes, dataset.source_path)
-                if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
-                    break
-            except Exception as e:
-                network_gui.conn = None
+            if network_gui.conn == None:
+                network_gui.try_connect()
+            while network_gui.conn != None:
+                try:
+                    net_image_bytes = None
+                    custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
+                    if custom_cam != None:
+                        net_image = render_imp(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
+                        net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
+                    network_gui.send(net_image_bytes, dataset.source_path)
+                    if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
+                        break
+                except Exception as e:
+                    network_gui.conn = None
 
-        iter_start.record()
-        gaussians.update_learning_rate(iteration)
+            iter_start.record()
+            gaussians.update_learning_rate(iteration)
 
-        # ---Update SH degree---
-        if iteration % 1000 == 0 and iteration>args.simp_iteration1:
-            gaussians.oneupSHdegree()
+            # ---Update SH degree---
+            if iteration % 1000 == 0 and iteration>args.simp_iteration1:
+                gaussians.oneupSHdegree()
 
-        # ---Select random viewpoint---
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras_warn_up(iteration, args.warn_until_iter, scale=1.0, scale2=2.0).copy()
-            viewpoint_idx_stack = list(range(len(viewpoint_stack)))
+            # ---Select random viewpoint---
+            if not viewpoint_stack:
+                viewpoint_stack = scene.getTrainCameras_warn_up(iteration, args.warn_until_iter, scale=1.0, scale2=2.0).copy()
+                viewpoint_idx_stack = list(range(len(viewpoint_stack)))
 
-        _random_view_idx = randint(0, len(viewpoint_stack)-1)
-        viewpoint_idx = viewpoint_idx_stack.pop(_random_view_idx)
-        viewpoint_cam = viewpoint_stack.pop(_random_view_idx)
+            _random_view_idx = randint(0, len(viewpoint_stack)-1)
+            viewpoint_idx = viewpoint_idx_stack.pop(_random_view_idx)
+            viewpoint_cam = viewpoint_stack.pop(_random_view_idx)
 
-        # ---Render scene---
-        if (iteration - 1) == debug_from:
-            pipe.debug = True
+            # ---Render scene---
+            if (iteration - 1) == debug_from:
+                pipe.debug = True
             
-        reg_kick_on = iteration >= args.regularization_from_iter
-        mesh_kick_on = args.mesh_regularization and (iteration >= mesh_config["start_iter"])
-        depth_order_kick_on = args.depth_order
-        moge_enabled = args.moge
-        moge_depth_mode = (
-            moge_config.get("depth", "none").lower() if (moge_enabled and moge_config) else "none"
-        )
-        moge_requires_expected_depth = (
-            moge_enabled
-            and moge_config
-            and moge_depth_mode != "none"
-            and moge_config.get("depth_ratio", 1.0) < 1.0
-        )
+            reg_kick_on = iteration >= args.regularization_from_iter
+            mesh_kick_on = args.mesh_regularization and (iteration >= mesh_config["start_iter"])
+            depth_order_kick_on = args.depth_order
+            moge_enabled = args.moge
+            moge_depth_mode = (
+                moge_config.get("depth", "none").lower() if (moge_enabled and moge_config) else "none"
+            )
+            moge_requires_expected_depth = (
+                moge_enabled
+                and moge_config
+                and moge_depth_mode != "none"
+                and moge_config.get("depth_ratio", 1.0) < 1.0
+            )
         
-        # If depth-normal regularization or mesh-in-the-loop regularization are active,
-        # we use the rasterizer compatible with depth and normal rendering.
-        if reg_kick_on or mesh_kick_on:
-            render_pkg = render(
-                viewpoint_cam, gaussians, pipe, background,
-                require_coord=False, require_depth=True,
-            )
-            
-        # Else, if depth-order or MoGe supervision is active, we use Mini-Splatting2 rasterizer 
-        # but we render depth maps. This rasterizer is necessary for densification and simplification.
-        elif depth_order_kick_on or moge_enabled:
-            render_pkg = render_full(
-                viewpoint_cam, gaussians, pipe, background, 
-                culling=gaussians._culling[:,viewpoint_cam.uid],
-                compute_expected_normals=False,
-                compute_expected_depth=(
-                    depth_order_kick_on or moge_requires_expected_depth
-                ),
-                compute_accurate_median_depth_gradient=(
-                    depth_order_kick_on or (moge_enabled and moge_depth_mode != "none")
-                ),
-            )
-            
-        # If no regularization is active, we just use the default Mini-Splatting2 rasterizer.
-        else:
-            render_pkg = render_imp(
-                viewpoint_cam, gaussians, pipe, background, 
-                culling=gaussians._culling[:,viewpoint_cam.uid],
-            )
-
-        # ---Compute losses---
-        image, viewspace_point_tensor, visibility_filter, radii = (
-            render_pkg["render"], render_pkg["viewspace_points"], 
-            render_pkg["visibility_filter"], render_pkg["radii"]
-        )
-        gt_image = viewpoint_cam.original_image.cuda()
-
-        moge_training_mask = None
-        if (
-            args.moge
-            and args.moge_mask_training
-            and moge_supervision is not None
-        ):
-            mask_tensor = moge_supervision["depth_mask"][viewpoint_idx].to(image.device)
-            if mask_tensor.dim() == 2:
-                mask_tensor = mask_tensor.unsqueeze(0)
-            if mask_tensor.shape[-2:] != image.shape[-2:]:
-                mask_tensor = F.interpolate(
-                    mask_tensor.unsqueeze(0), size=image.shape[-2:], mode="nearest"
-                ).squeeze(0)
-            mask_tensor = (mask_tensor > 0.5).to(image.dtype)
-            if mask_tensor.sum() > 0:
-                moge_training_mask = mask_tensor
-            else:
-                moge_training_mask = None
-        
-        if moge_training_mask is not None:
-            mask_rgb = moge_training_mask.expand_as(image)
-        else:
-            mask_rgb = None
-
-        if gaussians.use_bilateral_grid:
-            if iteration % 500 == 0:
-                image_before = image.clone().detach()
-
-                save_image(image_before, f"img/render_before_bilateral_{viewpoint_idx}_{iteration}.png")
-            image = gaussians._apply_bilateral_grid(
-                image, viewpoint_idx, viewpoint_cam.image_height, viewpoint_cam.image_width
-            )
-            if iteration % 500 == 0:
-                image_after = image.clone().detach()
-
-                save_image(image_after, f"img/render_after_bilateral_{viewpoint_idx}_{iteration}.png")
-        # Rendering loss
-        if args.decoupled_appearance:
-            if mask_rgb is not None:
-                transformed_image = L1_loss_appearance(
-                    image, gt_image, gaussians, viewpoint_cam.uid, return_transformed_image=True
+            # If depth-normal regularization or mesh-in-the-loop regularization are active,
+            # we use the rasterizer compatible with depth and normal rendering.
+            if reg_kick_on or mesh_kick_on:
+                render_pkg = render(
+                    viewpoint_cam, gaussians, pipe, background,
+                    require_coord=False, require_depth=True,
                 )
-                diff = torch.abs(transformed_image - gt_image) * mask_rgb
-                Ll1 = diff.sum() / mask_rgb.sum().clamp_min(1e-6)
-                image_for_ssim = image * mask_rgb
-                gt_for_ssim = gt_image * mask_rgb
-            else:
-                Ll1 = L1_loss_appearance(image, gt_image, gaussians, viewpoint_cam.uid)
-                image_for_ssim = image
-                gt_for_ssim = gt_image
-        else:
-            if mask_rgb is not None:
-                diff = torch.abs(image - gt_image) * mask_rgb
-                Ll1 = diff.sum() / mask_rgb.sum().clamp_min(1e-6)
-                image_for_ssim = image * mask_rgb
-                gt_for_ssim = gt_image * mask_rgb
-            else:
-                Ll1 = l1_loss(image, gt_image)
-                image_for_ssim = image
-                gt_for_ssim = gt_image
-
-        ssim_value = fused_ssim(image_for_ssim.unsqueeze(0), gt_for_ssim.unsqueeze(0))
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
-        
-        # Depth-Normal Consistency Regularization
-        if reg_kick_on:
-            rendered_depth_to_normals: torch.Tensor = depth_to_normal(
-                viewpoint_cam, 
-                render_pkg["median_depth"],  # 1, H, W
-                render_pkg["expected_depth"],  # 1, H, W
-            )  # 3, H, W or 2, 3, H, W
-            rendered_normals: torch.Tensor = render_pkg["normal"]  # 3, H, W
             
-            if rendered_depth_to_normals.ndim == 4:
-                # If shape is 2, 3, H, W
-                reg_depth_ratio = 0.6
-                normal_error_map = 1. - (rendered_normals[None] * rendered_depth_to_normals).sum(dim=1)  # 2, H, W
-                depth_normal_loss = args.lambda_depth_normal * (
-                    (1. - reg_depth_ratio) * normal_error_map[0].mean() 
-                    + reg_depth_ratio * normal_error_map[1].mean()
+            # Else, if depth-order or MoGe supervision is active, we use Mini-Splatting2 rasterizer 
+            # but we render depth maps. This rasterizer is necessary for densification and simplification.
+            elif depth_order_kick_on or moge_enabled:
+                render_pkg = render_full(
+                    viewpoint_cam, gaussians, pipe, background, 
+                    culling=gaussians._culling[:,viewpoint_cam.uid],
+                    compute_expected_normals=False,
+                    compute_expected_depth=(
+                        depth_order_kick_on or moge_requires_expected_depth
+                    ),
+                    compute_accurate_median_depth_gradient=(
+                        depth_order_kick_on or (moge_enabled and moge_depth_mode != "none")
+                    ),
                 )
+            
+            # If no regularization is active, we just use the default Mini-Splatting2 rasterizer.
             else:
-                # If shape is 3, H, W
-                depth_normal_loss = args.lambda_depth_normal * (1 - (rendered_normals * rendered_depth_to_normals).sum(dim=0)).mean()
-            
-            loss = loss + depth_normal_loss
-            
-        # Depth Order Regularization
-        # > This loss relies on Depth-AnythingV2, and is not used in MILo paper.
-        # > In the paper, MILo does not rely on any learned prior. 
-        if depth_order_kick_on:
-            if depth_order_config["depth_ratio"] < 1.:
-                depth_for_depth_order = (
-                    (1. - depth_order_config["depth_ratio"]) * render_pkg["expected_depth"]
-                    + depth_order_config["depth_ratio"] * render_pkg["median_depth"]
+                render_pkg = render_imp(
+                    viewpoint_cam, gaussians, pipe, background, 
+                    culling=gaussians._culling[:,viewpoint_cam.uid],
                 )
-            else:
-                depth_for_depth_order = render_pkg["median_depth"]
-                
-            depth_prior_loss, _, do_supervision_depth, lambda_depth_order = compute_depth_order_regularization(
-                iteration=iteration,
-                rendered_depth=depth_for_depth_order,
-                depth_priors=depth_priors,
-                viewpoint_idx=viewpoint_idx,
-                gaussians=gaussians,
-                config=depth_order_config,
+
+            # ---Compute losses---
+            image, viewspace_point_tensor, visibility_filter, radii = (
+                render_pkg["render"], render_pkg["viewspace_points"], 
+                render_pkg["visibility_filter"], render_pkg["radii"]
             )
-                
-            loss = loss + depth_prior_loss
-            depth_order_kick_on = lambda_depth_order > 0
-        
-        moge_depth_loss = None
-        moge_normal_loss = None
-        moge_supervision_depth = None
-        moge_supervision_normal = None
-        moge_lambda = 0.0
-        moge_supervision_mask = moge_training_mask
-        if moge_enabled and moge_supervision is not None:
-            moge_pkg = compute_moge_regularization(
-                iteration=iteration,
-                render_pkg=render_pkg,
-                viewpoint_idx=viewpoint_idx,
-                gaussians=gaussians,
-                config=moge_config,
-                moge_supervision=moge_supervision,
-            )
-            loss = loss + moge_pkg["total_loss"]
-            moge_depth_loss = moge_pkg["depth_loss"]
-            moge_normal_loss = moge_pkg["normal_loss"]
-            moge_supervision_depth = moge_pkg["supervision_depth"]
-            moge_supervision_normal = moge_pkg["supervision_normal"]
-            if moge_pkg["supervision_mask"] is not None:
-                moge_supervision_mask = moge_pkg["supervision_mask"]
-            moge_lambda = moge_pkg["lambda_value"]
-        moge_kick_on = (
-            moge_enabled
-            and (moge_lambda > 0)
-            and (
-                (moge_depth_loss is not None)
-                or (moge_normal_loss is not None)
-            )
-        )
-        moge_logging_active = moge_kick_on or (moge_training_mask is not None)
+            gt_image = viewpoint_cam.original_image.cuda()
 
-        # Mesh-In-the-Loop Regularization
-        if mesh_kick_on:
-            if args.detach_gaussian_rendering:
-                detached_render_pkg = {
-                    "render": render_pkg["render"].detach(),
-                    "median_depth": render_pkg["median_depth"].detach(),
-                    "expected_depth": render_pkg["expected_depth"].detach(),
-                    "normal": render_pkg["normal"].detach(),
-                }
-            
-            mesh_regularization_pkg = compute_mesh_regularization(
-                iteration=iteration,
-                render_pkg=detached_render_pkg if args.detach_gaussian_rendering else render_pkg,
-                viewpoint_cam=viewpoint_cam,
-                viewpoint_idx=viewpoint_idx,
-                gaussians=gaussians,
-                scene=scene,
-                pipe=pipe,
-                background=background,
-                kernel_size=0.0,
-                config=mesh_config,
-                mesh_renderer=mesh_renderer,
-                mesh_state=mesh_state,
-                render_func=partial(render, require_coord=False, require_depth=True),
-                weight_adjustment=100. / opt.iterations,
-                args=args,
-                integrate_func=integrate,
-            )
-            mesh_loss = mesh_regularization_pkg["mesh_loss"]
-            mesh_depth_loss = mesh_regularization_pkg["mesh_depth_loss"]
-            mesh_normal_loss = mesh_regularization_pkg["mesh_normal_loss"]
-            occupied_centers_loss = mesh_regularization_pkg["occupied_centers_loss"]
-            occupancy_labels_loss = mesh_regularization_pkg["occupancy_labels_loss"]
-            mesh_state = mesh_regularization_pkg["updated_state"]
-            mesh_render_pkg = mesh_regularization_pkg["mesh_render_pkg"]
-            
-            loss = loss + mesh_loss
-        
-        if gaussians.use_bilateral_grid:
-            tv_loss = 10 * total_variation_loss(gaussians.bil_grids.grids)
-            loss = loss + tv_loss
-
-        # ---Backward pass---
-        loss.backward()
-
-        iter_end.record()
-
-        with torch.no_grad():
-            # ---Logging---
-            (
-                postfix_dict,
-                ema_loss_for_log, 
-                ema_depth_normal_loss_for_log, 
-                ema_mesh_depth_loss_for_log, ema_mesh_normal_loss_for_log, 
-                ema_occupied_centers_loss_for_log, ema_occupancy_labels_loss_for_log, 
-                ema_depth_order_loss_for_log, ema_moge_depth_loss_for_log, ema_moge_normal_loss_for_log
-            ) = log_training_progress(
-                args, iteration, log_interval, progress_bar, run,
-                scene, gaussians, pipe, opt, background,
-                viewpoint_idx, viewpoint_cam, render_pkg, 
-                mesh_render_pkg if mesh_kick_on else None, 
-                do_supervision_depth if depth_order_kick_on else None,
-                reg_kick_on, mesh_kick_on, depth_order_kick_on,
-                loss, depth_normal_loss if reg_kick_on else None, 
-                mesh_depth_loss if mesh_kick_on else None, mesh_normal_loss if mesh_kick_on else None, 
-                occupied_centers_loss if mesh_kick_on else None, occupancy_labels_loss if mesh_kick_on else None, 
-                depth_prior_loss if depth_order_kick_on else None,
-                tv_loss if gaussians.use_bilateral_grid else None,
-                mesh_config if mesh_kick_on else None, 
-                postfix_dict, ema_loss_for_log, ema_depth_normal_loss_for_log, ema_mesh_depth_loss_for_log, 
-                ema_mesh_normal_loss_for_log, ema_occupied_centers_loss_for_log, ema_occupancy_labels_loss_for_log,
-                ema_depth_order_loss_for_log, ema_tv_loss_for_log, testing_iterations, saving_iterations, render_imp,
-                moge_logging_active,
-                moge_depth_loss if moge_kick_on else None,
-                moge_normal_loss if moge_kick_on else None,
-                ema_moge_depth_loss_for_log,
-                ema_moge_normal_loss_for_log,
-                moge_supervision_depth if moge_kick_on else None,
-                moge_supervision_normal if moge_kick_on else None,
-                moge_supervision_mask,
-            )
-
-            # ---Densification---
-            gaussians_have_changed = False
-            if iteration < opt.densify_until_iter:
-                # Keep track of max radii in image-space for pruning
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-
-                if gaussians._culling[:,viewpoint_cam.uid].sum()==0:
-                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+            moge_training_mask = None
+            if (
+                args.moge
+                and args.moge_mask_training
+                and moge_supervision is not None
+            ):
+                mask_tensor = moge_supervision["depth_mask"][viewpoint_idx].to(image.device)
+                if mask_tensor.dim() == 2:
+                    mask_tensor = mask_tensor.unsqueeze(0)
+                if mask_tensor.shape[-2:] != image.shape[-2:]:
+                    mask_tensor = F.interpolate(
+                        mask_tensor.unsqueeze(0), size=image.shape[-2:], mode="nearest"
+                    ).squeeze(0)
+                mask_tensor = (mask_tensor > 0.5).to(image.dtype)
+                if mask_tensor.sum() > 0:
+                    moge_training_mask = mask_tensor
                 else:
-                    # normalize xy gradient after culling
-                    gaussians.add_densification_stats_culling(viewspace_point_tensor, visibility_filter, gaussians.factor_culling)
+                    moge_training_mask = None
+        
+            if moge_training_mask is not None:
+                mask_rgb = moge_training_mask.expand_as(image)
+            else:
+                mask_rgb = None
 
-                area_max = render_pkg["area_max"]
-                mask_blur = torch.logical_or(mask_blur, area_max>(image.shape[1]*image.shape[2]/5000))
+            if gaussians.use_bilateral_grid:
+                if iteration % 500 == 0:
+                    image_before = image.clone().detach()
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and iteration != args.depth_reinit_iter:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune_mask(opt.densify_grad_threshold, 
-                                                    0.005, scene.cameras_extent, 
-                                                    size_threshold, mask_blur)
-                    mask_blur = torch.zeros(gaussians._xyz.shape[0], device='cuda')
-                    gaussians_have_changed = True
-                    if use_mip_filter:
-                        gaussians.compute_3D_filter(
-                            cameras=scene.getTrainCameras_warn_up(
-                                iteration, args.warn_until_iter, scale=1.0, scale2=2.0
-                            ).copy()
-                        )
+                    save_image(image_before, f"img/render_before_bilateral_{viewpoint_idx}_{iteration}.png")
+                image = gaussians._apply_bilateral_grid(
+                    image, viewpoint_idx, viewpoint_cam.image_height, viewpoint_cam.image_width
+                )
+                if iteration % 500 == 0:
+                    image_after = image.clone().detach()
+
+                    save_image(image_after, f"img/render_after_bilateral_{viewpoint_idx}_{iteration}.png")
+            # Rendering loss
+            if args.decoupled_appearance:
+                if mask_rgb is not None:
+                    transformed_image = L1_loss_appearance(
+                        image, gt_image, gaussians, viewpoint_cam.uid, return_transformed_image=True
+                    )
+                    diff = torch.abs(transformed_image - gt_image) * mask_rgb
+                    Ll1 = diff.sum() / mask_rgb.sum().clamp_min(1e-6)
+                    image_for_ssim = image * mask_rgb
+                    gt_for_ssim = gt_image * mask_rgb
+                else:
+                    Ll1 = L1_loss_appearance(image, gt_image, gaussians, viewpoint_cam.uid)
+                    image_for_ssim = image
+                    gt_for_ssim = gt_image
+            else:
+                if mask_rgb is not None:
+                    diff = torch.abs(image - gt_image) * mask_rgb
+                    Ll1 = diff.sum() / mask_rgb.sum().clamp_min(1e-6)
+                    image_for_ssim = image * mask_rgb
+                    gt_for_ssim = gt_image * mask_rgb
+                else:
+                    Ll1 = l1_loss(image, gt_image)
+                    image_for_ssim = image
+                    gt_for_ssim = gt_image
+
+            ssim_value = fused_ssim(image_for_ssim.unsqueeze(0), gt_for_ssim.unsqueeze(0))
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+        
+            # Depth-Normal Consistency Regularization
+            if reg_kick_on:
+                rendered_depth_to_normals: torch.Tensor = depth_to_normal(
+                    viewpoint_cam, 
+                    render_pkg["median_depth"],  # 1, H, W
+                    render_pkg["expected_depth"],  # 1, H, W
+                )  # 3, H, W or 2, 3, H, W
+                rendered_normals: torch.Tensor = render_pkg["normal"]  # 3, H, W
+            
+                if rendered_depth_to_normals.ndim == 4:
+                    # If shape is 2, 3, H, W
+                    reg_depth_ratio = 0.6
+                    normal_error_map = 1. - (rendered_normals[None] * rendered_depth_to_normals).sum(dim=1)  # 2, H, W
+                    depth_normal_loss = args.lambda_depth_normal * (
+                        (1. - reg_depth_ratio) * normal_error_map[0].mean() 
+                        + reg_depth_ratio * normal_error_map[1].mean()
+                    )
+                else:
+                    # If shape is 3, H, W
+                    depth_normal_loss = args.lambda_depth_normal * (1 - (rendered_normals * rendered_depth_to_normals).sum(dim=0)).mean()
+            
+                loss = loss + depth_normal_loss
+            
+            # Depth Order Regularization
+            # > This loss relies on Depth-AnythingV2, and is not used in MILo paper.
+            # > In the paper, MILo does not rely on any learned prior. 
+            if depth_order_kick_on:
+                if depth_order_config["depth_ratio"] < 1.:
+                    depth_for_depth_order = (
+                        (1. - depth_order_config["depth_ratio"]) * render_pkg["expected_depth"]
+                        + depth_order_config["depth_ratio"] * render_pkg["median_depth"]
+                    )
+                else:
+                    depth_for_depth_order = render_pkg["median_depth"]
+                
+                depth_prior_loss, _, do_supervision_depth, lambda_depth_order = compute_depth_order_regularization(
+                    iteration=iteration,
+                    rendered_depth=depth_for_depth_order,
+                    depth_priors=depth_priors,
+                    viewpoint_idx=viewpoint_idx,
+                    gaussians=gaussians,
+                    config=depth_order_config,
+                )
+                
+                loss = loss + depth_prior_loss
+                depth_order_kick_on = lambda_depth_order > 0
+        
+            moge_depth_loss = None
+            moge_normal_loss = None
+            moge_supervision_depth = None
+            moge_supervision_normal = None
+            moge_lambda = 0.0
+            moge_supervision_mask = moge_training_mask
+            if moge_enabled and moge_supervision is not None:
+                moge_pkg = compute_moge_regularization(
+                    iteration=iteration,
+                    render_pkg=render_pkg,
+                    viewpoint_idx=viewpoint_idx,
+                    gaussians=gaussians,
+                    config=moge_config,
+                    moge_supervision=moge_supervision,
+                )
+                loss = loss + moge_pkg["total_loss"]
+                moge_depth_loss = moge_pkg["depth_loss"]
+                moge_normal_loss = moge_pkg["normal_loss"]
+                moge_supervision_depth = moge_pkg["supervision_depth"]
+                moge_supervision_normal = moge_pkg["supervision_normal"]
+                if moge_pkg["supervision_mask"] is not None:
+                    moge_supervision_mask = moge_pkg["supervision_mask"]
+                moge_lambda = moge_pkg["lambda_value"]
+            moge_kick_on = (
+                moge_enabled
+                and (moge_lambda > 0)
+                and (
+                    (moge_depth_loss is not None)
+                    or (moge_normal_loss is not None)
+                )
+            )
+            moge_logging_active = moge_kick_on or (moge_training_mask is not None)
+
+            # Mesh-In-the-Loop Regularization
+            if mesh_kick_on:
+                if args.detach_gaussian_rendering:
+                    detached_render_pkg = {
+                        "render": render_pkg["render"].detach(),
+                        "median_depth": render_pkg["median_depth"].detach(),
+                        "expected_depth": render_pkg["expected_depth"].detach(),
+                        "normal": render_pkg["normal"].detach(),
+                    }
+            
+                mesh_regularization_pkg = compute_mesh_regularization(
+                    iteration=iteration,
+                    render_pkg=detached_render_pkg if args.detach_gaussian_rendering else render_pkg,
+                    viewpoint_cam=viewpoint_cam,
+                    viewpoint_idx=viewpoint_idx,
+                    gaussians=gaussians,
+                    scene=scene,
+                    pipe=pipe,
+                    background=background,
+                    kernel_size=0.0,
+                    config=mesh_config,
+                    mesh_renderer=mesh_renderer,
+                    mesh_state=mesh_state,
+                    render_func=partial(render, require_coord=False, require_depth=True),
+                    weight_adjustment=100. / opt.iterations,
+                    args=args,
+                    integrate_func=integrate,
+                )
+                mesh_loss = mesh_regularization_pkg["mesh_loss"]
+                mesh_depth_loss = mesh_regularization_pkg["mesh_depth_loss"]
+                mesh_normal_loss = mesh_regularization_pkg["mesh_normal_loss"]
+                occupied_centers_loss = mesh_regularization_pkg["occupied_centers_loss"]
+                occupancy_labels_loss = mesh_regularization_pkg["occupancy_labels_loss"]
+                mesh_state = mesh_regularization_pkg["updated_state"]
+                mesh_render_pkg = mesh_regularization_pkg["mesh_render_pkg"]
+            
+                loss = loss + mesh_loss
+        
+            if gaussians.use_bilateral_grid:
+                tv_loss = 10 * total_variation_loss(gaussians.bil_grids.grids)
+                loss = loss + tv_loss
+            else:
+                tv_loss = None
+
+            scale_loss = None
+            if args.scale_regularization:
+                scales = gaussians.get_scaling
+                effective_radius = torch.linalg.vector_norm(scales, dim=-1)
+                scale_loss = effective_radius.pow(3).mean()
+                scale_loss = args.scale_regularization_weight * scale_loss
+                loss = loss + scale_loss
+
+            # ---Backward pass---
+            loss.backward()
+
+            iter_end.record()
+
+            with torch.no_grad():
+                # ---Logging---
+                (
+                    postfix_dict,
+                    ema_loss_for_log, 
+                    ema_depth_normal_loss_for_log, 
+                    ema_mesh_depth_loss_for_log, ema_mesh_normal_loss_for_log, 
+                    ema_occupied_centers_loss_for_log, ema_occupancy_labels_loss_for_log, 
+                    ema_depth_order_loss_for_log, ema_scale_loss_for_log, ema_moge_depth_loss_for_log, ema_moge_normal_loss_for_log
+                ) = log_training_progress(
+                    args, iteration, log_interval, progress_bar, run,
+                    scene, gaussians, pipe, opt, background,
+                    viewpoint_idx, viewpoint_cam, render_pkg, 
+                    mesh_render_pkg if mesh_kick_on else None, 
+                    do_supervision_depth if depth_order_kick_on else None,
+                    reg_kick_on, mesh_kick_on, depth_order_kick_on,
+                    loss, depth_normal_loss if reg_kick_on else None, 
+                    mesh_depth_loss if mesh_kick_on else None, mesh_normal_loss if mesh_kick_on else None, 
+                    occupied_centers_loss if mesh_kick_on else None, occupancy_labels_loss if mesh_kick_on else None, 
+                    depth_prior_loss if depth_order_kick_on else None,
+                    tv_loss,
+                    scale_loss if args.scale_regularization else None,
+                    mesh_config if mesh_kick_on else None, 
+                    postfix_dict, ema_loss_for_log, ema_depth_normal_loss_for_log, ema_mesh_depth_loss_for_log, 
+                    ema_mesh_normal_loss_for_log, ema_occupied_centers_loss_for_log, ema_occupancy_labels_loss_for_log,
+                    ema_depth_order_loss_for_log, ema_scale_loss_for_log, ema_tv_loss_for_log, testing_iterations, saving_iterations, render_imp,
+                    moge_logging_active,
+                    moge_depth_loss if moge_kick_on else None,
+                    moge_normal_loss if moge_kick_on else None,
+                    ema_moge_depth_loss_for_log,
+                    ema_moge_normal_loss_for_log,
+                    moge_supervision_depth if moge_kick_on else None,
+                    moge_supervision_normal if moge_kick_on else None,
+                    moge_supervision_mask,
+                )
+
+                # ---Densification---
+                gaussians_have_changed = False
+                if iteration < opt.densify_until_iter:
+                    # Keep track of max radii in image-space for pruning
+                    gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+
+                    if gaussians._culling[:,viewpoint_cam.uid].sum()==0:
+                        gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                    else:
+                        # normalize xy gradient after culling
+                        gaussians.add_densification_stats_culling(viewspace_point_tensor, visibility_filter, gaussians.factor_culling)
+
+                    area_max = render_pkg["area_max"]
+                    mask_blur = torch.logical_or(mask_blur, area_max>(image.shape[1]*image.shape[2]/5000))
+
+                    if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and iteration != args.depth_reinit_iter:
+                        size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                        gaussians.densify_and_prune_mask(opt.densify_grad_threshold, 
+                                                        0.005, scene.cameras_extent, 
+                                                        size_threshold, mask_blur)
+                        mask_blur = torch.zeros(gaussians._xyz.shape[0], device='cuda')
+                        gaussians_have_changed = True
+                        if use_mip_filter:
+                            gaussians.compute_3D_filter(
+                                cameras=scene.getTrainCameras_warn_up(
+                                    iteration, args.warn_until_iter, scale=1.0, scale2=2.0
+                                ).copy()
+                            )
                     
-                if iteration == args.depth_reinit_iter:
+                    if iteration == args.depth_reinit_iter:
 
-                    num_depth = gaussians._xyz.shape[0]*args.num_depth_factor
+                        num_depth = gaussians._xyz.shape[0]*args.num_depth_factor
 
-                    # interesction_preserving for better point cloud reconstruction result at the early stage, not affect rendering quality
-                    gaussians.interesction_preserving(scene, render_simp, iteration, args, pipe, background)
-                    if use_mip_filter:
-                        gaussians.compute_3D_filter(
-                            cameras=scene.getTrainCameras_warn_up(
-                                iteration, args.warn_until_iter, scale=1.0, scale2=2.0
-                            ).copy()
-                        )
+                        # interesction_preserving for better point cloud reconstruction result at the early stage, not affect rendering quality
+                        gaussians.interesction_preserving(scene, render_simp, iteration, args, pipe, background)
+                        if use_mip_filter:
+                            gaussians.compute_3D_filter(
+                                cameras=scene.getTrainCameras_warn_up(
+                                    iteration, args.warn_until_iter, scale=1.0, scale2=2.0
+                                ).copy()
+                            )
                         
-                    pts, rgb = gaussians.depth_reinit(scene, render_depth, iteration, num_depth, args, pipe, background)
+                        pts, rgb = gaussians.depth_reinit(scene, render_depth, iteration, num_depth, args, pipe, background)
 
-                    gaussians.reinitial_pts(pts, rgb)
+                        gaussians.reinitial_pts(pts, rgb)
+
+                        gaussians.training_setup(opt)
+                        gaussians.init_culling(len(scene.getTrainCameras()))
+                        mask_blur = torch.zeros(gaussians._xyz.shape[0], device='cuda')
+                        torch.cuda.empty_cache()
+                        gaussians_have_changed = True
+                        if use_mip_filter:
+                            gaussians.compute_3D_filter(
+                                cameras=scene.getTrainCameras_warn_up(
+                                    iteration, args.warn_until_iter, scale=1.0, scale2=2.0
+                                ).copy()
+                            )
+
+                    if iteration >= args.aggressive_clone_from_iter and iteration % args.aggressive_clone_interval == 0 and iteration!=args.depth_reinit_iter:
+                        gaussians.culling_with_clone(scene, render_simp, iteration, args, pipe, background)
+                        torch.cuda.empty_cache()
+                        mask_blur = torch.zeros(gaussians._xyz.shape[0], device='cuda')
+                        gaussians_have_changed = True
+                        if use_mip_filter:
+                            gaussians.compute_3D_filter(
+                                cameras=scene.getTrainCameras_warn_up(
+                                    iteration, args.warn_until_iter, scale=1.0, scale2=2.0
+                                ).copy()
+                            )
+
+                # ---Pruning and simplification---
+                if iteration == args.simp_iteration1:
+                    if args.dense_gaussians:
+                        gaussians.culling_with_importance_pruning(scene, render_simp, iteration, args, pipe, background)
+                    else:
+                        gaussians.culling_with_interesction_sampling(scene, render_simp, iteration, args, pipe, background)
+                    gaussians.max_sh_degree=dataset.sh_degree
+                    gaussians.extend_features_rest()
 
                     gaussians.training_setup(opt)
+                    torch.cuda.empty_cache()
+                    gaussians_have_changed = True
+                    if use_mip_filter:
+                            gaussians.compute_3D_filter(
+                                cameras=scene.getTrainCameras_warn_up(
+                                    iteration, args.warn_until_iter, scale=1.0, scale2=2.0
+                                ).copy()
+                            )
+                
+                if iteration == args.simp_iteration2:
+                    if args.dense_gaussians:
+                        gaussians.culling_with_importance_pruning(scene, render_simp, iteration, args, pipe, background)
+                    else:
+                        gaussians.culling_with_interesction_preserving(scene, render_simp, iteration, args, pipe, background)
+                    torch.cuda.empty_cache()
+                    gaussians_have_changed = True
+                    if use_mip_filter:
+                            gaussians.compute_3D_filter(
+                                cameras=scene.getTrainCameras_warn_up(
+                                    iteration, args.warn_until_iter, scale=1.0, scale2=2.0
+                                ).copy()
+                            )
+
+                if iteration == (args.simp_iteration2+opt.iterations)//2:
                     gaussians.init_culling(len(scene.getTrainCameras()))
-                    mask_blur = torch.zeros(gaussians._xyz.shape[0], device='cuda')
-                    torch.cuda.empty_cache()
-                    gaussians_have_changed = True
-                    if use_mip_filter:
-                        gaussians.compute_3D_filter(
-                            cameras=scene.getTrainCameras_warn_up(
-                                iteration, args.warn_until_iter, scale=1.0, scale2=2.0
-                            ).copy()
-                        )
 
-                if iteration >= args.aggressive_clone_from_iter and iteration % args.aggressive_clone_interval == 0 and iteration!=args.depth_reinit_iter:
-                    gaussians.culling_with_clone(scene, render_simp, iteration, args, pipe, background)
-                    torch.cuda.empty_cache()
-                    mask_blur = torch.zeros(gaussians._xyz.shape[0], device='cuda')
-                    gaussians_have_changed = True
-                    if use_mip_filter:
-                        gaussians.compute_3D_filter(
-                            cameras=scene.getTrainCameras_warn_up(
-                                iteration, args.warn_until_iter, scale=1.0, scale2=2.0
-                            ).copy()
-                        )
+                # ---Reset mesh state if Gaussians have changed---
+                if mesh_kick_on and gaussians_have_changed:
+                    mesh_state = reset_mesh_state_at_next_iteration(mesh_state)
+                
+                # ---Update 3D Mip Filter---
+                if use_mip_filter and (
+                    (iteration == args.warn_until_iter)
+                    or (iteration % args.update_mip_filter_every == 0)
+                ):
+                    gaussians.compute_3D_filter(cameras=scene.getTrainCameras_warn_up(iteration, args.warn_until_iter, scale=1.0, scale2=2.0).copy())
 
-            # ---Pruning and simplification---
-            if iteration == args.simp_iteration1:
-                if args.dense_gaussians:
-                    gaussians.culling_with_importance_pruning(scene, render_simp, iteration, args, pipe, background)
-                else:
-                    gaussians.culling_with_interesction_sampling(scene, render_simp, iteration, args, pipe, background)
-                gaussians.max_sh_degree=dataset.sh_degree
-                gaussians.extend_features_rest()
+                # ---Optimizer step---
+                if iteration < opt.iterations:
+                    if gaussians.use_appearance_network or gaussians.use_bilateral_grid:
+                        gaussians.optimizer.step()
+                    else:
+                        visible = radii>0
+                        gaussians.optimizer.step(visible, radii.shape[0])
+                    gaussians.optimizer.zero_grad(set_to_none = True)
 
-                gaussians.training_setup(opt)
+                # ---Save checkpoint---
+                if (iteration in checkpoint_iterations):
+                    print("\n[ITER {}] Saving Checkpoint".format(iteration))
+                    torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")  
+                
+            if iteration % 100 == 0:
                 torch.cuda.empty_cache()
-                gaussians_have_changed = True
-                if use_mip_filter:
-                        gaussians.compute_3D_filter(
-                            cameras=scene.getTrainCameras_warn_up(
-                                iteration, args.warn_until_iter, scale=1.0, scale2=2.0
-                            ).copy()
-                        )
-                
-            if iteration == args.simp_iteration2:
-                if args.dense_gaussians:
-                    gaussians.culling_with_importance_pruning(scene, render_simp, iteration, args, pipe, background)
-                else:
-                    gaussians.culling_with_interesction_preserving(scene, render_simp, iteration, args, pipe, background)
-                torch.cuda.empty_cache()
-                gaussians_have_changed = True
-                if use_mip_filter:
-                        gaussians.compute_3D_filter(
-                            cameras=scene.getTrainCameras_warn_up(
-                                iteration, args.warn_until_iter, scale=1.0, scale2=2.0
-                            ).copy()
-                        )
-
-            if iteration == (args.simp_iteration2+opt.iterations)//2:
-                gaussians.init_culling(len(scene.getTrainCameras()))
-
-            # ---Reset mesh state if Gaussians have changed---
-            if mesh_kick_on and gaussians_have_changed:
-                mesh_state = reset_mesh_state_at_next_iteration(mesh_state)
-                
-            # ---Update 3D Mip Filter---
-            if use_mip_filter and (
-                (iteration == args.warn_until_iter)
-                or (iteration % args.update_mip_filter_every == 0)
-            ):
-                gaussians.compute_3D_filter(cameras=scene.getTrainCameras_warn_up(iteration, args.warn_until_iter, scale=1.0, scale2=2.0).copy())
-
-            # ---Optimizer step---
-            if iteration < opt.iterations:
-                if gaussians.use_appearance_network or gaussians.use_bilateral_grid:
-                    gaussians.optimizer.step()
-                else:
-                    visible = radii>0
-                    gaussians.optimizer.step(visible, radii.shape[0])
-                gaussians.optimizer.zero_grad(set_to_none = True)
-
-            # ---Save checkpoint---
-            if (iteration in checkpoint_iterations):
-                print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")  
-                
-        if iteration % 100 == 0:
-            torch.cuda.empty_cache()
-            gc.collect()
-
+                gc.collect()
+            if profiler is not None:
+                profiler.step()
     print('Num of Gaussians: %d'%(gaussians._xyz.shape[0]))
     
     if WANDB_FOUND:
@@ -712,6 +755,12 @@ if __name__ == "__main__":
     parser.add_argument("--regularization_from_iter", type=int, default = 3_000)
     parser.add_argument("--lambda_depth_normal", type=float, default = 0.05)
     
+    # ----- Scale Regularization -----
+    parser.add_argument("--scale_regularization", action="store_true",
+                        help="Enable radius-based scale regularization on Gaussians.")
+    parser.add_argument("--scale_regularization_weight", type=float, default=1e-3,
+                        help="Weight applied to the scale regularization loss.")
+    
     # ----- Depth Order Regularization (Learned Prior) -----
     # > This loss relies on Depth-AnythingV2, and is not used in MILo paper.
     # > In the paper, MILo does not rely on any learned prior.
@@ -738,6 +787,7 @@ if __name__ == "__main__":
     parser.add_argument("--log_interval", type=int, default=None)
     parser.add_argument("--wandb_project", type=str, default=None)
     parser.add_argument("--wandb_entity", type=str, default=None)
+    parser.add_argument("--use_profiler", action="store_true", help="Enable PyTorch profiler with TensorBoard trace output.")
     
     args = parser.parse_args(sys.argv[1:])
 
