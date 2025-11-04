@@ -20,7 +20,11 @@ from scene.mesh import MeshRasterizer, MeshRenderer, ScalableMeshRenderer, Meshe
 from regularization.sdf.integration import evaluate_cull_sdf_values as compute_sdf_with_integration
 from regularization.sdf.depth_fusion import evaluate_sdf_values as compute_sdf_with_depth_fusion
 from regularization.sdf.depth_fusion import evaluate_mesh_occupancy, evaluate_mesh_colors_all_vertices
-from regularization.sdf.learnable import compute_initial_sdf_with_binary_search
+from regularization.sdf.learnable import (
+    compute_initial_sdf_with_binary_search,
+    set_sdf_asinh_scale,
+    set_sdf_asinh_enabled,
+)
 
 import gc
 from utils.geometry_utils import depth_to_normal as depth_double_to_normal
@@ -65,6 +69,23 @@ def extract_mesh_with_sdf_refinement(
     scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
     gaussians.load_ply(os.path.join(dataset.model_path, "point_cloud", f"iteration_{iteration}", "point_cloud.ply"))
     gaussians.set_occupancy_mode(mesh_config["occupancy_mode"])
+    
+    use_sdf_asinh = bool(mesh_config.get("use_sdf_asinh", True))
+    mesh_config["use_sdf_asinh"] = use_sdf_asinh
+    if use_sdf_asinh:
+        sdf_scale = mesh_config.get("sdf_asinh_scale")
+        if sdf_scale is None:
+            ratio = float(mesh_config.get("sdf_asinh_scale_ratio", 0.02))
+            scene_diag = float(scene.cameras_extent) * 2.0
+            sdf_scale = max(scene_diag * ratio, 1e-4)
+        sdf_scale = float(sdf_scale)
+        mesh_config["sdf_asinh_scale"] = sdf_scale
+        set_sdf_asinh_enabled(True)
+        set_sdf_asinh_scale(sdf_scale)
+    else:
+        sdf_scale = None
+        mesh_config["sdf_asinh_scale"] = None
+        set_sdf_asinh_enabled(False)
     
     bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -182,7 +203,7 @@ def extract_mesh_with_sdf_refinement(
                 n_linearization_steps=args.sdf_reset_linearization_n_steps,
                 enforce_std=sdf_reset_linearization_enforce_std if args.n_binary_steps_to_reset_sdf > 0 else None,
             )  # Between -1 and 1
-            base_occupancy = convert_sdf_to_occupancy(base_occupancy)  # Between 0.005 and 0.995
+            base_occupancy = convert_sdf_to_occupancy(base_occupancy, scale=sdf_scale)  # Between 0.005 and 0.995
             
             # Reshape base occupancy to make it (N_sampled_gaussians, 9)
             base_occupancy = unflatten_voronoi_features(
@@ -246,7 +267,8 @@ def extract_mesh_with_sdf_refinement(
         else:
             current_occupancy = gaussians.get_occupancy  # (N_gaussians, 9)
         current_voronoi_sdf = convert_occupancy_to_sdf(
-                flatten_voronoi_features(current_occupancy)
+                flatten_voronoi_features(current_occupancy),
+                scale=sdf_scale,
             )  # (N_voronoi_points, )
         
         # Differentiable Marching Tetrahedra
@@ -460,7 +482,8 @@ def extract_mesh_with_sdf_refinement(
         else:
             current_occupancy = gaussians.get_occupancy  # (N_gaussians, 9)
         current_voronoi_sdf = convert_occupancy_to_sdf(
-                flatten_voronoi_features(current_occupancy)
+                flatten_voronoi_features(current_occupancy),
+                scale=sdf_scale,
             )  # (N_voronoi_points, )
         
         # Differentiable Marching Tetrahedra

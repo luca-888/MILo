@@ -59,6 +59,7 @@ from regularization.regularizer.moge import (
 
 from regularization.bilateral_grid.lib_bilagrid import total_variation_loss
 from torchvision.utils import save_image
+from regularization.sdf.learnable import set_sdf_asinh_scale, set_sdf_asinh_enabled
 
 
 def _accumulate_loss(loss_terms: dict, key: str, value: torch.Tensor) -> None:
@@ -240,6 +241,22 @@ def training(
         if key not in loss_weight_cfg:
             loss_weight_cfg[key] = default
     mesh_config["loss_weights"] = loss_weight_cfg
+    use_sdf_asinh = bool(mesh_config.get("use_sdf_asinh", True))
+    mesh_config["use_sdf_asinh"] = use_sdf_asinh
+    if use_sdf_asinh:
+        sdf_scale = mesh_config.get("sdf_asinh_scale")
+        if sdf_scale is None:
+            ratio = float(mesh_config.get("sdf_asinh_scale_ratio", 0.02))
+            # Approximate scene diagonal using camera extent radius
+            scene_diag = float(scene.cameras_extent) * 2.0
+            sdf_scale = max(scene_diag * ratio, 1e-4)
+        sdf_scale = float(sdf_scale)
+        mesh_config["sdf_asinh_scale"] = sdf_scale
+        set_sdf_asinh_enabled(True)
+        set_sdf_asinh_scale(sdf_scale)
+    else:
+        mesh_config["sdf_asinh_scale"] = None
+        set_sdf_asinh_enabled(False)
         
     # ---Profiler setup---
     if args.use_profiler:

@@ -142,6 +142,12 @@ def compute_mesh_regularization(
 
     lambda_mesh_depth = config["depth_weight"]
     lambda_mesh_normal = config["normal_weight"]
+    use_sdf_asinh = bool(config.get("use_sdf_asinh", True))
+    sdf_scale = config.get("sdf_asinh_scale", None)
+    if use_sdf_asinh and sdf_scale is not None:
+        sdf_scale = float(sdf_scale)
+    else:
+        sdf_scale = None
 
     # --- State Management ---
     # For filtering Delaunay points
@@ -376,7 +382,7 @@ def compute_mesh_regularization(
                     n_linearization_steps=config["sdf_reset_linearization_n_steps"],
                     enforce_std=config["sdf_reset_linearization_enforce_std"] if config["n_binary_steps_to_reset_sdf"] > 0 else None,
                 )  # Between -1 and 1
-                base_occupancy = convert_sdf_to_occupancy(base_occupancy)  # Between 0.005 and 0.995
+                base_occupancy = convert_sdf_to_occupancy(base_occupancy, scale=sdf_scale)  # Between 0.005 and 0.995
                 
                 # Reshape base occupancy to make it (N_sampled_gaussians, 9)
                 base_occupancy = unflatten_voronoi_features(
@@ -422,7 +428,8 @@ def compute_mesh_regularization(
         else:
             current_occupancy = gaussians.get_occupancy  # (N_gaussians, 9)
         current_voronoi_sdf = convert_occupancy_to_sdf(
-            flatten_voronoi_features(current_occupancy)
+            flatten_voronoi_features(current_occupancy),
+            scale=sdf_scale,
         )  # (N_voronoi_points, )
 
         # --- Marching Tetrahedra ---

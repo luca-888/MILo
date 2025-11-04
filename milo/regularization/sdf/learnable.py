@@ -11,6 +11,30 @@ from utils.geometry_utils import unflatten_voronoi_features
 from regularization.sdf.depth_fusion import evaluate_sdf_values
 import gc
 
+_SDF_ASINH_SCALE = 1.0
+_SDF_ASINH_MAX_ABS = 6.0  # avoid overflow in sinh/asinh
+_USE_SDF_ASINH = True
+
+
+def set_sdf_asinh_scale(scale: float):
+    global _SDF_ASINH_SCALE
+    if scale <= 0:
+        raise ValueError("sdf_asinh_scale must be positive.")
+    _SDF_ASINH_SCALE = float(scale)
+
+
+def get_sdf_asinh_scale() -> float:
+    return _SDF_ASINH_SCALE
+
+
+def set_sdf_asinh_enabled(enabled: bool):
+    global _USE_SDF_ASINH
+    _USE_SDF_ASINH = bool(enabled)
+
+
+def is_sdf_asinh_enabled() -> bool:
+    return _USE_SDF_ASINH
+
 
 def refine_intersections_with_binary_search(
     end_points:torch.Tensor,
@@ -231,13 +255,44 @@ def compute_initial_sdf_with_binary_search(
     return linearized_sdf
 
 
+def _clamp_tensor(x: torch.Tensor, limit):
+    if limit is None:
+        return x
+    if isinstance(limit, torch.Tensor):
+        max_val = limit.to(x.device, x.dtype)
+    else:
+        max_val = torch.tensor(limit, device=x.device, dtype=x.dtype)
+    return torch.clamp(x, min=-max_val, max=max_val)
+
+
 def convert_sdf_to_occupancy(
-    sdf:torch.Tensor,
+    sdf: torch.Tensor,
+    scale: float = None,
 ):
-    return - sdf * 0.99 / 2. + 0.5  # Between 0.005 and 0.995
+    use_asinh = is_sdf_asinh_enabled()
+    if scale is None and use_asinh:
+        scale = get_sdf_asinh_scale()
+    if not use_asinh or scale is None:
+        # Linear mapping fallback
+        return (-sdf * 0.99 / 2.0 + 0.5).clamp(min=0.005, max=0.995)
+
+    scale = max(float(scale), 1e-6)
+    psi = torch.sinh(_clamp_tensor(sdf / scale, _SDF_ASINH_MAX_ABS))
+    occupancy = 0.5 - 0.5 * 0.99 * psi
+    return occupancy.clamp(min=0.005, max=0.995)
 
 
 def convert_occupancy_to_sdf(
-    occupancy:torch.Tensor,
+    occupancy: torch.Tensor,
+    scale: float = None,
 ):
-    return - (occupancy - 0.5) * 2. / 0.99  # Between -1 and 1
+    use_asinh = is_sdf_asinh_enabled()
+    if scale is None and use_asinh:
+        scale = get_sdf_asinh_scale()
+    if not use_asinh or scale is None:
+        return - (occupancy - 0.5) * 2.0 / 0.99
+
+    scale = max(float(scale), 1e-6)
+    psi = - (occupancy - 0.5) * 2.0 / 0.99
+    psi = _clamp_tensor(psi, torch.sinh(torch.tensor(_SDF_ASINH_MAX_ABS, device=occupancy.device)))
+    return scale * torch.asinh(psi)
