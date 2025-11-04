@@ -18,7 +18,7 @@
 
 import torch
 
-__all__ = ['marching_tetrahedra']
+__all__ = ['marching_tetrahedra', 'compute_tet_edge_mapping']
 
 triangle_table = torch.tensor([
     [-1, -1, -1, -1, -1, -1],
@@ -44,56 +44,25 @@ base_tet_edges = torch.tensor([0, 1, 0, 2, 0, 3, 1, 2, 1, 3, 2, 3], dtype=torch.
 v_id = torch.pow(2, torch.arange(4, dtype=torch.long))
 
 
-def _unbatched_marching_tetrahedra(vertices, tets, sdf, scales):
+def compute_tet_edge_mapping(tets: torch.Tensor):
+    """Pre-compute unique edges and per-tetra edge indices mapping."""
+    # Gather the 6 edges per tetrahedron
+    edges = tets[:, base_tet_edges].reshape(-1, 2)
+    order = (edges[:, 0] > edges[:, 1]).bool()
+    if order.any():
+        edges[order] = edges[order][:, [1, 0]]
+    unique_edges, inverse = torch.unique(edges, dim=0, return_inverse=True)
+    tet_edges = inverse.view(-1, 6)
+    return unique_edges, tet_edges
+
+
+def _unbatched_marching_tetrahedra(vertices, tets, sdf, scales, edge_vertices=None, tet_edge_ids=None):
     """unbatched marching tetrahedra.
 
     Refer to :func:`marching_tetrahedra`.
     """
     device = vertices.device
     
-    # call by chunk
-    chunk_size = 32 * 1024 * 1024
-    if tets.shape[0] > chunk_size:
-        merged_verts = None
-        merged_scales = None
-        merged_faces = None
-        merged_verts_ids = None
-        for tet_chunk in torch.chunk(tets, tets.shape[0] // chunk_size + 1):
-            torch.cuda.empty_cache()
-            verts, verts_scales, faces, verts_ids = _unbatched_marching_tetrahedra(vertices, tet_chunk, sdf, scales)
-            
-            if merged_verts is None:
-                merged_verts = verts
-                merged_scales = verts_scales
-                merged_faces = faces
-                merged_verts_ids = verts_ids
-            else:
-                all_edges = torch.cat([merged_verts_ids, verts_ids], dim=0)
-                unique_edges, idx_map = torch.unique(all_edges, dim=0, return_inverse=True)
-                # merge vertices
-                unique_verts_0 = torch.zeros((unique_edges.shape[0], 2, 3), dtype=torch.float, device=device)
-                unique_verts_1 = torch.zeros((unique_edges.shape[0], 2, 1), dtype=torch.float, device=device)
-                unique_verts_0[idx_map[:merged_verts[0].shape[0]]] = merged_verts[0]  
-                unique_verts_0[idx_map[merged_verts[0].shape[0]:]] = verts[0]         
-                unique_verts_1[idx_map[:merged_verts[1].shape[0]]] = merged_verts[1]  
-                unique_verts_1[idx_map[merged_verts[1].shape[0]:]] = verts[1]         
-                # merge scales
-                unique_scales = torch.zeros((unique_edges.shape[0], 2, 1), dtype=torch.float, device=device)
-                unique_scales[idx_map[:merged_verts[0].shape[0]]] = merged_scales     
-                unique_scales[idx_map[merged_verts[0].shape[0]:]] = verts_scales      
-                
-                # merge faces
-                unique_faces_0 = idx_map[merged_faces.reshape(-1)].reshape(-1, 3)
-                unique_faces_1 = idx_map[faces.reshape(-1) + merged_verts[0].shape[0]].reshape(-1, 3)
-
-                merged_faces = torch.cat([unique_faces_0, unique_faces_1], dim=0)
-                merged_verts = (unique_verts_0, unique_verts_1)
-                merged_scales = unique_scales
-                merged_verts_ids = unique_edges
-                torch.cuda.empty_cache()
-                
-        return merged_verts, merged_scales, merged_faces, merged_verts_ids
-        
     with torch.no_grad():
         occ_n = sdf > 0
         occ_fx4 = occ_n[tets.reshape(-1)].reshape(-1, 4)
@@ -101,21 +70,30 @@ def _unbatched_marching_tetrahedra(vertices, tets, sdf, scales):
         
         valid_tets = (occ_sum > 0) & (occ_sum < 4)
         
-        # find all vertices
-        all_edges = tets[valid_tets][:, base_tet_edges.to(device)].reshape(-1, 2)
-        
-        order = (all_edges[:, 0] > all_edges[:, 1]).bool()
-        all_edges[order] = all_edges[order][:, [1, 0]]
-        
-        unique_edges, idx_map = torch.unique(all_edges, dim=0, return_inverse=True)
-        
-        unique_edges = unique_edges.long()
-        mask_edges = occ_n[unique_edges.reshape(-1)].reshape(-1, 2).sum(-1) == 1
-        mapping = torch.ones((unique_edges.shape[0]), dtype=torch.long, device=device) * -1
+        if edge_vertices is None or tet_edge_ids is None:
+            all_edges = tets[valid_tets][:, base_tet_edges.to(device)].reshape(-1, 2)
+            order = (all_edges[:, 0] > all_edges[:, 1]).bool()
+            all_edges[order] = all_edges[order][:, [1, 0]]
+            edge_vertices, idx_map = torch.unique(all_edges, dim=0, return_inverse=True)
+            edge_vertices = edge_vertices.long()
+        else:
+            edge_vertices = edge_vertices.to(device)
+            idx_map = tet_edge_ids.to(device)[valid_tets].reshape(-1, 6)
+
+        edge_occ = occ_n[edge_vertices.reshape(-1)].reshape(-1, 2)
+        mask_edges = edge_occ.sum(-1) == 1
+        if mask_edges.sum() == 0:
+            empty = torch.zeros((0, 2, 3), dtype=vertices.dtype, device=device)
+            empty_sdf = torch.zeros((0, 2, 1), dtype=sdf.dtype, device=device)
+            empty_scales = torch.zeros((0, 2, 1), dtype=scales.dtype, device=device)
+            empty_faces = torch.zeros((0, 3), dtype=torch.long, device=device)
+            return (empty, empty_sdf), empty_scales, empty_faces, edge_vertices[mask_edges]
+
+        mapping = torch.full((edge_vertices.shape[0],), -1, dtype=torch.long, device=device)
         mapping[mask_edges] = torch.arange(mask_edges.sum(), dtype=torch.long, device=device)
         idx_map = mapping[idx_map]
 
-        interp_v = unique_edges[mask_edges]
+        interp_v = edge_vertices[mask_edges]
     edges_to_interp = vertices[interp_v.reshape(-1)].reshape(-1, 2, 3)
     edges_to_interp_sdf = sdf[interp_v.reshape(-1)].reshape(-1, 2, 1)
     verts_scales = scales[interp_v.reshape(-1)].reshape(-1, 2, 1)
@@ -138,7 +116,7 @@ def _unbatched_marching_tetrahedra(vertices, tets, sdf, scales):
     return verts, verts_scales, faces, interp_v
 
 
-def marching_tetrahedra(vertices, tets, sdf, scales):
+def marching_tetrahedra(vertices, tets, sdf, scales, edge_vertices=None, tet_edge_ids=None):
     r"""Convert discrete signed distance fields encoded on tetrahedral grids to triangle 
     meshes using marching tetrahedra algorithm as described in `An efficient method of 
     triangulating equi-valued surfaces by using tetrahedral cells`_. The output surface is differentiable with respect to
@@ -185,6 +163,15 @@ def marching_tetrahedra(vertices, tets, sdf, scales):
     .. _Deep Marching Tetrahedra\: a Hybrid Representation for High-Resolution 3D Shape Synthesis:
             https://arxiv.org/abs/2111.04276
     """
-
-    list_of_outputs = [_unbatched_marching_tetrahedra(vertices[b], tets, sdf[b], scales[b]) for b in range(vertices.shape[0])]
+    list_of_outputs = [
+        _unbatched_marching_tetrahedra(
+            vertices[b],
+            tets,
+            sdf[b],
+            scales[b],
+            edge_vertices=edge_vertices,
+            tet_edge_ids=tet_edge_ids,
+        )
+        for b in range(vertices.shape[0])
+    ]
     return list(zip(*list_of_outputs))

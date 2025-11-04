@@ -9,7 +9,7 @@ from scene.cameras import Camera
 from gaussian_renderer import render_simp
 from scene.mesh import Meshes, MeshRasterizer, MeshRenderer, ScalableMeshRenderer
 from scene.gaussian_model import GaussianModel
-from utils.tetmesh import marching_tetrahedra
+from utils.tetmesh import marching_tetrahedra, compute_tet_edge_mapping
 from utils.camera_utils import get_cameras_spatial_extent
 from utils.geometry_utils import is_in_view_frustum
 from utils.geometry_utils import depth_to_normal as depth_double_to_normal
@@ -76,6 +76,8 @@ def initialize_mesh_regularization(
         "surface_delaunay_xyz_idx": None,
         "reset_delaunay_samples": True,
         "reset_sdf_values": True,
+        "delaunay_edges": None,
+        "delaunay_edge_ids": None,
     }
 
     return mesh_renderer, mesh_state
@@ -148,6 +150,8 @@ def compute_mesh_regularization(
     voronoi_occupancy_labels = mesh_state["voronoi_occupancy_labels"]  # (N_voronoi_points, )
     # Delaunay tetrahedralization
     delaunay_tets = mesh_state["delaunay_tets"]  # (N_tets, 4)
+    delaunay_edges = mesh_state["delaunay_edges"]
+    delaunay_edge_ids = mesh_state["delaunay_edge_ids"]
     # Flags
     reset_delaunay_samples = mesh_state["reset_delaunay_samples"]
     reset_sdf_values = mesh_state["reset_sdf_values"]
@@ -164,6 +168,8 @@ def compute_mesh_regularization(
     if iteration < config['stop_iter']:
         if iteration % config["delaunay_reset_interval"] == 0:
             delaunay_tets = None
+            delaunay_edges = None
+            delaunay_edge_ids = None
             reset_delaunay_samples = True
 
         if iteration % config["sdf_reset_interval"] == 0:
@@ -296,9 +302,10 @@ def compute_mesh_regularization(
                         delaunay_xyz_idx = None
                         print(f"[INFO] No need to downsample Delaunay Gaussians.")
 
-                torch.cuda.empty_cache()
                 reset_delaunay_samples = False # Reset flag after computation
                 delaunay_tets = None # If downsampling, we need to recompute the tetrahedra
+                delaunay_edges = None
+                delaunay_edge_ids = None
         else:
             delaunay_xyz_idx = None # Ensure it's None if not used
 
@@ -316,7 +323,7 @@ def compute_mesh_regularization(
             with torch.no_grad():
                 # Ensure points are detached before passing to C++ extension
                 delaunay_tets = cpp.triangulate(voronoi_points.detach()).cuda().long()
-            torch.cuda.empty_cache()
+                delaunay_edges, delaunay_edge_ids = compute_tet_edge_mapping(delaunay_tets)
 
         # --- Compute SDF values ---
         # Check if an SDF reset has to be enforced because of a shape mismatch
@@ -405,7 +412,6 @@ def compute_mesh_regularization(
                 )
                 
                 # Clear cache
-                torch.cuda.empty_cache()
                 gc.collect()
             
                 reset_sdf_values = False # Reset flag after computation
@@ -424,7 +430,9 @@ def compute_mesh_regularization(
             vertices=voronoi_points[None],
             tets=delaunay_tets,
             sdf=current_voronoi_sdf.reshape(1, -1), # Use the computed SDF for this iteration
-            scales=voronoi_scale[None]
+            scales=voronoi_scale[None],
+            edge_vertices=delaunay_edges,
+            tet_edge_ids=delaunay_edge_ids,
         )
         end_points, end_sdf = verts_list[0]  # (N_verts, 2, 3) and (N_verts, 2, 1)
         end_scales = scale_list[0]  # (N_verts, 2, 1)
@@ -601,6 +609,8 @@ def compute_mesh_regularization(
     mesh_state["voronoi_occupancy_labels"] = voronoi_occupancy_labels
     # Store Updated Delaunay tetrahedra
     mesh_state["delaunay_tets"] = delaunay_tets
+    mesh_state["delaunay_edges"] = delaunay_edges
+    mesh_state["delaunay_edge_ids"] = delaunay_edge_ids
     # Reset flags were potentially set back to False inside the logic
     mesh_state["reset_delaunay_samples"] = reset_delaunay_samples
     mesh_state["reset_sdf_values"] = reset_sdf_values
@@ -624,4 +634,6 @@ def reset_mesh_state_at_next_iteration(mesh_state):
     mesh_state["reset_delaunay_samples"] = True
     mesh_state["reset_sdf_values"] = True
     mesh_state["delaunay_tets"] = None
+    mesh_state["delaunay_edges"] = None
+    mesh_state["delaunay_edge_ids"] = None
     return mesh_state

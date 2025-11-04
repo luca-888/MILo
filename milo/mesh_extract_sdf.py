@@ -12,7 +12,7 @@ from gaussian_renderer import GaussianModel, render_simp
 import numpy as np
 import trimesh
 from tetranerf.utils.extension import cpp
-from utils.tetmesh import marching_tetrahedra
+from utils.tetmesh import marching_tetrahedra, compute_tet_edge_mapping
 from utils.camera_utils import get_cameras_spatial_extent
 
 from scene.mesh import MeshRasterizer, MeshRenderer, ScalableMeshRenderer, Meshes
@@ -117,6 +117,7 @@ def extract_mesh_with_sdf_refinement(
     # Compute Delaunay triangulation
     start_time = time.time()
     delaunay_tets = cpp.triangulate(voronoi_points.detach()).cuda().long()
+    delaunay_edges, delaunay_edge_ids = compute_tet_edge_mapping(delaunay_tets)
     end_time = time.time()
     print(f"Delaunay triangulation time: {end_time - start_time} seconds")
     
@@ -253,7 +254,9 @@ def extract_mesh_with_sdf_refinement(
             vertices=voronoi_points[None],
             tets=delaunay_tets,
             sdf=current_voronoi_sdf.reshape(1, -1), # Use the computed SDF for this iteration
-            scales=voronoi_scales[None]
+            scales=voronoi_scales[None],
+            edge_vertices=delaunay_edges,
+            tet_edge_ids=delaunay_edge_ids,
         )
         end_points, end_sdf = verts_list[0]  # (N_verts, 2, 3) and (N_verts, 2, 1)
         end_scales = scale_list[0]  # (N_verts, 2, 1)
@@ -447,7 +450,6 @@ def extract_mesh_with_sdf_refinement(
             refine_optimizer.zero_grad(set_to_none = True)
             
         if iteration % 100 == 0:
-            torch.cuda.empty_cache()
             gc.collect()
             
     # --- Build the final mesh ---
@@ -466,7 +468,9 @@ def extract_mesh_with_sdf_refinement(
             vertices=voronoi_points[None],
             tets=delaunay_tets,
             sdf=current_voronoi_sdf.reshape(1, -1), # Use the computed SDF for this iteration
-            scales=voronoi_scales[None]
+            scales=voronoi_scales[None],
+            edge_vertices=delaunay_edges,
+            tet_edge_ids=delaunay_edge_ids,
         )
         end_points, end_sdf = verts_list[0]  # (N_verts, 2, 3) and (N_verts, 2, 1)
         end_scales = scale_list[0]  # (N_verts, 2, 1)

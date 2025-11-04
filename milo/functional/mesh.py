@@ -3,7 +3,7 @@ import numpy as np
 import torch
 from scene.cameras import Camera
 from scene.mesh import Meshes
-from utils.tetmesh import marching_tetrahedra
+from utils.tetmesh import marching_tetrahedra, compute_tet_edge_mapping
 from utils.geometry_utils import is_in_view_frustum
 from functional.pivots import extract_gaussian_pivots
 
@@ -88,11 +88,14 @@ def extract_mesh(
 
 
     # --- Marching Tetrahedra ---
+    edge_vertices, tet_edge_ids = compute_tet_edge_mapping(delaunay_tets)
     verts_list, scale_list, faces_list, _ = marching_tetrahedra(
         vertices=pivots[None],
         tets=delaunay_tets,
         sdf=pivots_sdf.reshape(1, -1),
-        scales=pivots_scale[None]
+        scales=pivots_scale[None],
+        edge_vertices=edge_vertices,
+        tet_edge_ids=tet_edge_ids,
     )
     end_points, end_sdf = verts_list[0]  # (N_verts, 2, 3) and (N_verts, 2, 1)
     end_scales = scale_list[0]  # (N_verts, 2, 1)

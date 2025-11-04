@@ -6,7 +6,7 @@ from scene.mesh import Meshes, MeshRenderer
 from scene.gaussian_model import GaussianModel
 from scene.cameras import Camera
 from utils.geometry_utils import is_in_view_frustum
-from utils.tetmesh import marching_tetrahedra
+from utils.tetmesh import marching_tetrahedra, compute_tet_edge_mapping
 from utils.geometry_utils import unflatten_voronoi_features
 from regularization.sdf.depth_fusion import evaluate_sdf_values
 import gc
@@ -52,7 +52,6 @@ def refine_intersections_with_binary_search(
         
         points = (left_points + right_points) / 2  # (N_verts, 3)
 
-        torch.cuda.empty_cache()
         gc.collect()
         
     return points
@@ -190,12 +189,15 @@ def compute_initial_sdf_with_binary_search(
     
     # Refine the initial SDF values with binary search
     if n_binary_steps > 0:
+        edge_vertices, tet_edge_ids = compute_tet_edge_mapping(delaunay_tets)
         # Initial Marching Tetrahedra
         verts_list, scale_list, faces_list, interp_v = marching_tetrahedra(
             vertices=voronoi_points[None],
             tets=delaunay_tets,
             sdf=voronoi_sdf.reshape(1, -1),
-            scales=voronoi_scales[None]
+            scales=voronoi_scales[None],
+            edge_vertices=edge_vertices,
+            tet_edge_ids=tet_edge_ids,
         )
         end_points, end_sdf = verts_list[0]  # (N_verts, 2, 3) and (N_verts, 2, 1)
         end_scales = scale_list[0]  # (N_verts, 2, 1)

@@ -14,7 +14,7 @@ import numpy as np
 import trimesh
 from tetranerf.utils.extension import cpp
 from scene.mesh import Meshes
-from utils.tetmesh import marching_tetrahedra
+from utils.tetmesh import marching_tetrahedra, compute_tet_edge_mapping
 from regularization.sdf.integration import evaluate_cull_sdf_values as compute_sdf_with_integration
 from regularization.sdf.depth_fusion import evaluate_sdf_values as compute_sdf_with_depth_fusion
 from regularization.sdf.depth_fusion import evaluate_mesh_colors_all_vertices
@@ -79,16 +79,32 @@ def marching_tetrahedra_with_binary_search(
     else:
         raise ValueError(f"Invalid sdf mode: {sdf_mode}")
     sdf = sdf_function(points, views, mask, gaussians, pipeline, background, kernel_size)
-    torch.cuda.empty_cache()
-
     # Apply marching tetrahedra to get the mesh.
     # This requires a lot of memory, so you might want to move it to cpu.
     if mtet_on_cpu:
         print("[INFO] Running marching_tetrahedra on CPU.")
-        verts_list, scale_list, faces_list, interp_v = marching_tetrahedra(points.cpu()[None], cells.cpu().long(), sdf[None].cpu(), points_scale[None].cpu())
+        cells_cpu = cells.cpu().long()
+        edge_vertices_cpu, tet_edge_ids_cpu = compute_tet_edge_mapping(cells_cpu)
+        verts_list, scale_list, faces_list, interp_v = marching_tetrahedra(
+            points.cpu()[None],
+            cells_cpu,
+            sdf[None].cpu(),
+            points_scale[None].cpu(),
+            edge_vertices=edge_vertices_cpu,
+            tet_edge_ids=tet_edge_ids_cpu,
+        )
     else:
         print("[INFO] Running marching_tetrahedra on GPU.")
-        verts_list, scale_list, faces_list, interp_v = marching_tetrahedra(points[None], cells.cuda().long(), sdf[None], points_scale[None])
+        cells_gpu = cells.cuda().long()
+        edge_vertices_gpu, tet_edge_ids_gpu = compute_tet_edge_mapping(cells_gpu)
+        verts_list, scale_list, faces_list, interp_v = marching_tetrahedra(
+            points[None],
+            cells_gpu,
+            sdf[None],
+            points_scale[None],
+            edge_vertices=edge_vertices_gpu,
+            tet_edge_ids=tet_edge_ids_gpu,
+        )
     del points
     del points_scale
     del cells
