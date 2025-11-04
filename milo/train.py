@@ -60,6 +60,76 @@ from regularization.regularizer.moge import (
 from regularization.bilateral_grid.lib_bilagrid import total_variation_loss
 from torchvision.utils import save_image
 
+
+def _accumulate_loss(loss_terms: dict, key: str, value: torch.Tensor) -> None:
+    if value is None:
+        return
+    if key in loss_terms:
+        loss_terms[key] = loss_terms[key] + value
+    else:
+        loss_terms[key] = value
+
+
+def _get_loss_weight(spec, iteration: int) -> float:
+    if spec is None:
+        return 0.0
+    if isinstance(spec, (int, float)):
+        return float(spec)
+
+    start_iter = int(spec.get("start_iter", 0))
+    if iteration < start_iter:
+        return 0.0
+
+    end_iter = spec.get("end_iter")
+    if end_iter is not None and iteration >= int(end_iter):
+        return 0.0
+
+    base = float(spec.get("value", 1.0))
+    target = spec.get("target")
+    if target is None:
+        return base
+
+    ramp_iters = float(spec.get("ramp_iters", spec.get("ramp_length", 0)))
+    if ramp_iters <= 0:
+        return float(target)
+
+    progress = min(1.0, max(0.0, (iteration - start_iter) / ramp_iters))
+    schedule = spec.get("ramp", "linear").lower()
+    if schedule == "exp":
+        # Exponential interpolation in log space
+        base_safe = max(1e-8, base)
+        target_safe = max(1e-8, float(target))
+        return float(base_safe * (target_safe / base_safe) ** progress)
+    # Default linear ramp
+    return float(base + (float(target) - base) * progress)
+
+
+def _combine_losses(loss_terms: dict, weight_spec: dict, iteration: int):
+    if not loss_terms:
+        raise ValueError("No loss terms provided for combination.")
+
+    weights_applied = {}
+    total_loss = None
+    for name, tensor in loss_terms.items():
+        spec = weight_spec.get(name)
+        if spec is None:
+            # Default to 1.0 for photo, else 0.0 so that missing entries are explicit
+            spec = 1.0 if name == "photo" else 0.0
+        weight = _get_loss_weight(spec, iteration)
+        weights_applied[name] = weight
+
+        if total_loss is None:
+            total_loss = tensor * weight
+        else:
+            total_loss = total_loss + tensor * weight
+
+    if total_loss is None:
+        # Fallback to zero tensor on same device as any existing term
+        sample_tensor = next(iter(loss_terms.values()))
+        total_loss = torch.zeros_like(sample_tensor)
+
+    return total_loss, weights_applied
+
 def training(
     dataset, opt, pipe, 
     testing_iterations, saving_iterations, 
@@ -158,6 +228,18 @@ def training(
     ema_moge_normal_loss_for_log = 0.0
     ema_tv_loss_for_log = 0.0
     ema_scale_loss_for_log = 0.0
+    # Loss weight schedule setup
+    loss_weight_cfg = mesh_config.get("loss_weights", {})
+    default_loss_weights = {
+        "photo": {"value": 1.0},
+        "vis": {"value": 0.0},
+        "ray": {"value": 0.0},
+        "shape": {"value": 1.0},
+    }
+    for key, default in default_loss_weights.items():
+        if key not in loss_weight_cfg:
+            loss_weight_cfg[key] = default
+    mesh_config["loss_weights"] = loss_weight_cfg
         
     # ---Profiler setup---
     if args.use_profiler:
@@ -353,7 +435,8 @@ def training(
                     gt_for_ssim = gt_image
 
             ssim_value = fused_ssim(image_for_ssim.unsqueeze(0), gt_for_ssim.unsqueeze(0))
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+            photo_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+            loss_terms = {"photo": photo_loss}
         
             # Depth-Normal Consistency Regularization
             if reg_kick_on:
@@ -376,7 +459,7 @@ def training(
                     # If shape is 3, H, W
                     depth_normal_loss = args.lambda_depth_normal * (1 - (rendered_normals * rendered_depth_to_normals).sum(dim=0)).mean()
             
-                loss = loss + depth_normal_loss
+                _accumulate_loss(loss_terms, "shape", depth_normal_loss)
             
             # Depth Order Regularization
             # > This loss relies on Depth-AnythingV2, and is not used in MILo paper.
@@ -399,7 +482,7 @@ def training(
                     config=depth_order_config,
                 )
                 
-                loss = loss + depth_prior_loss
+                _accumulate_loss(loss_terms, "shape", depth_prior_loss)
                 depth_order_kick_on = lambda_depth_order > 0
         
             moge_depth_loss = None
@@ -417,7 +500,7 @@ def training(
                     config=moge_config,
                     moge_supervision=moge_supervision,
                 )
-                loss = loss + moge_pkg["total_loss"]
+                _accumulate_loss(loss_terms, "shape", moge_pkg["total_loss"])
                 moge_depth_loss = moge_pkg["depth_loss"]
                 moge_normal_loss = moge_pkg["normal_loss"]
                 moge_supervision_depth = moge_pkg["supervision_depth"]
@@ -471,11 +554,11 @@ def training(
                 mesh_state = mesh_regularization_pkg["updated_state"]
                 mesh_render_pkg = mesh_regularization_pkg["mesh_render_pkg"]
             
-                loss = loss + mesh_loss
+                _accumulate_loss(loss_terms, "shape", mesh_loss)
         
             if gaussians.use_bilateral_grid:
                 tv_loss = 10 * total_variation_loss(gaussians.bil_grids.grids)
-                loss = loss + tv_loss
+                _accumulate_loss(loss_terms, "shape", tv_loss)
             else:
                 tv_loss = None
 
@@ -485,10 +568,18 @@ def training(
                 effective_radius = torch.linalg.vector_norm(scales, dim=-1)
                 scale_loss = effective_radius.pow(3).mean()
                 scale_loss = args.scale_regularization_weight * scale_loss
-                loss = loss + scale_loss
+                _accumulate_loss(loss_terms, "shape", scale_loss)
+
+            for required_loss_key in loss_weight_cfg.keys():
+                if required_loss_key != "photo" and required_loss_key not in loss_terms:
+                    loss_terms[required_loss_key] = torch.zeros_like(photo_loss)
+
+            total_loss, weights_used = _combine_losses(loss_terms, loss_weight_cfg, iteration)
+            for weight_name, weight_value in weights_used.items():
+                postfix_dict[f"lambda_{weight_name}"] = weight_value
 
             # ---Backward pass---
-            loss.backward()
+            total_loss.backward()
 
             iter_end.record()
 
@@ -508,7 +599,7 @@ def training(
                     mesh_render_pkg if mesh_kick_on else None, 
                     do_supervision_depth if depth_order_kick_on else None,
                     reg_kick_on, mesh_kick_on, depth_order_kick_on,
-                    loss, depth_normal_loss if reg_kick_on else None, 
+                    total_loss, depth_normal_loss if reg_kick_on else None, 
                     mesh_depth_loss if mesh_kick_on else None, mesh_normal_loss if mesh_kick_on else None, 
                     occupied_centers_loss if mesh_kick_on else None, occupancy_labels_loss if mesh_kick_on else None, 
                     depth_prior_loss if depth_order_kick_on else None,

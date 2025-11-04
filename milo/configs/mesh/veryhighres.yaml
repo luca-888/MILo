@@ -3,6 +3,17 @@ start_iter: 8_001
 mesh_update_interval: 1 
 stop_iter: 18000
 
+# Loss weights (global multipliers controlled from train.py)
+loss_weights:
+  photo:
+    value: 1.0
+  vis:
+    value: 0.0
+  ray:
+    value: 0.0
+  shape:
+    value: 1.0
+
 # Depth loss weight
 use_depth_loss: true
 depth_weight: 0.05  # 0.05

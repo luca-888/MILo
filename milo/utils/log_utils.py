@@ -13,6 +13,8 @@ try:
 except ImportError:
     pass
 
+WANDB_AVAILABLE = "wandb" in globals()
+
 
 def fix_normal_map(view, normal, normal_in_view_space=True):
     """_summary_
@@ -117,44 +119,93 @@ def make_log_figure(
         return log_images_dict
 
 
-def training_report(iteration, l1_loss, testing_iterations, scene, renderFunc, renderArgs):
+def training_report(
+    iteration,
+    l1_loss,
+    testing_iterations,
+    scene,
+    renderFunc,
+    renderArgs,
+    run=None,
+    log_eval_images=False,
+    max_logged_views=2,
+):
     # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
-        # validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()},)        
+        validation_configs = (
+            {'name': 'test', 'cameras': scene.getTestCameras()},
+            {'name': 'train', 'cameras': [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]},
+        )
+
+        metrics_to_log = {}
+        images_to_log = {}
 
         for config in validation_configs:
-            if config['cameras'] and len(config['cameras']) > 0:
-                l1_test = 0.0
-                psnr_test = 0.0
-                ssims = []
-                lpipss = []
-                for idx, viewpoint in enumerate(config['cameras']):
-                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
+            cameras = config['cameras']
+            if not cameras:
+                continue
 
-                    gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-                    l1_test += l1_loss(image, gt_image).mean().double()
-                    psnr_test += psnr(image, gt_image).mean().double()
+            l1_test = 0.0
+            psnr_test = 0.0
+            ssims = []
+            lpipss = []
+            logged_view_count = 0
 
-                    ssims.append(ssim(image, gt_image))
-                    lpipss.append(lpips(image, gt_image, net_type='vgg'))                    
+            for idx, viewpoint in enumerate(cameras):
+                render_output = renderFunc(viewpoint, scene.gaussians, *renderArgs)
+                image = torch.clamp(render_output["render"], 0.0, 1.0)
+                gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
 
+                l1_test += l1_loss(image, gt_image).mean().double()
+                psnr_test += psnr(image, gt_image).mean().double()
+                ssims.append(ssim(image, gt_image))
+                lpipss.append(lpips(image, gt_image, net_type='vgg'))
 
-                psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras']) 
+                if (
+                    log_eval_images
+                    and run is not None
+                    and logged_view_count < max_logged_views
+                ):
+                    error_map = torch.mean(torch.abs(image - gt_image), dim=0, keepdim=True)
+                    error_map = (error_map - error_map.min()) / (error_map.max() - error_map.min() + 1e-6)
+                    error_map_np = error_map.squeeze().detach().cpu().numpy()
+                    cmap = plt.get_cmap('Spectral')
+                    error_map_color = cmap(error_map_np)[..., :3]
+                    error_map_color = (torch.from_numpy(error_map_color).float().clamp(0., 1.) * 255).to(torch.uint8)
 
-                ssims_test=torch.tensor(ssims).mean()
-                lpipss_test=torch.tensor(lpipss).mean()
+                    render_uint8 = (image.detach().cpu().clamp(0., 1.) * 255).to(torch.uint8)
+                    gt_uint8 = (gt_image.detach().cpu().clamp(0., 1.) * 255).to(torch.uint8)
 
-                print("\n[ITER {}] Evaluating {}: ".format(iteration, config['name']))
-                print("  SSIM : {:>12.7f}".format(ssims_test.mean(), ".5"))
-                print("  PSNR : {:>12.7f}".format(psnr_test.mean(), ".5"))
-                print("  LPIPS : {:>12.7f}".format(lpipss_test.mean(), ".5"))
-                print("")
+                    if WANDB_AVAILABLE:
+                        view_prefix = f"{config['name']}_view{idx}"
+                        images_to_log[f"{view_prefix}/render"] = wandb.Image(render_uint8.permute(1, 2, 0).numpy())
+                        images_to_log[f"{view_prefix}/gt"] = wandb.Image(gt_uint8.permute(1, 2, 0).numpy())
+                        images_to_log[f"{view_prefix}/error"] = wandb.Image(error_map_color.numpy())
+                    logged_view_count += 1
+
+            count = len(cameras)
+            psnr_test /= count
+            l1_test /= count
+            ssims_test = torch.tensor(ssims).mean()
+            lpipss_test = torch.tensor(lpipss).mean()
+
+            print("\n[ITER {}] Evaluating {}: ".format(iteration, config['name']))
+            print("  SSIM : {:>12.7f}".format(ssims_test.mean(), ".5"))
+            print("  PSNR : {:>12.7f}".format(psnr_test.mean(), ".5"))
+            print("  LPIPS : {:>12.7f}".format(lpipss_test.mean(), ".5"))
+            print("")
+
+            metrics_to_log[f"{config['name']}/psnr"] = float(psnr_test.mean())
+            metrics_to_log[f"{config['name']}/ssim"] = float(ssims_test.mean())
+            metrics_to_log[f"{config['name']}/lpips"] = float(lpipss_test.mean())
 
         torch.cuda.empty_cache()
+
+        if run is not None and metrics_to_log:
+            run.log(metrics_to_log, step=iteration)
+        if run is not None and images_to_log:
+            run.log(images_to_log, step=iteration)
 
 
 # TODO: Logging function should be made clearer and more modular.
@@ -193,7 +244,7 @@ def log_training_progress(
     moge_supervision_normal:torch.Tensor,
     moge_supervision_mask:torch.Tensor,
 ):
-    WANDB_FOUND = run is not None
+    WANDB_FOUND = (run is not None) and WANDB_AVAILABLE
     
     # ---Progress bar---
     ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
@@ -220,6 +271,9 @@ def log_training_progress(
         ema_tv_loss_for_log = 0.4 * tv_loss.item() + 0.6 * ema_tv_loss_for_log
 
     if iteration % 10 == 0:
+        lambda_entries = {
+            k: postfix_dict[k] for k in list(postfix_dict.keys()) if k.startswith("lambda_")
+        }
         postfix_dict = {"Loss": f"{ema_loss_for_log:.{7}f}"}
         if tv_loss:
             postfix_dict['TVLoss'] = f"{ema_tv_loss_for_log:.{7}f}"
@@ -242,6 +296,8 @@ def log_training_progress(
             if mesh_config["use_occupancy_labels_loss"]:
                 postfix_dict["OccLabLoss"] = f"{ema_occupancy_labels_loss_for_log:.{7}f}"
         postfix_dict["N_Gauss"] = f"{gaussians._xyz.shape[0]}"
+        for key, value in lambda_entries.items():
+            postfix_dict[key] = f"{float(value):.6f}"
         progress_bar.set_postfix(postfix_dict)
         progress_bar.update(10)
         
@@ -354,7 +410,16 @@ def log_training_progress(
                 run.log(wandb_log_images_dict, step=iteration)
 
     # ---Report---
-    training_report(iteration, l1_loss, testing_iterations, scene, render_imp, (pipe, background))
+    training_report(
+        iteration,
+        l1_loss,
+        testing_iterations,
+        scene,
+        render_imp,
+        (pipe, background),
+        run=run if WANDB_FOUND else None,
+        log_eval_images=WANDB_FOUND,
+    )
     if (iteration in saving_iterations):
         print("\n[ITER {}] Saving Gaussians".format(iteration))
         scene.save(iteration)
